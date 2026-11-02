@@ -1,0 +1,143 @@
+name: Build and publish badge firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional X.Y.Z; blank selects a version from Conventional Commits'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: badge-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      artifact_name: badge-release-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Plan release on the default branch
+        id: plan
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo 'Run this workflow on the current default branch.' >&2
+            exit 1
+          fi
+          python3 tools/release_badge.py plan --version "$REQUESTED_VERSION" \
+            --sha "$GITHUB_SHA" --output build/release-plan.json --github-output "$GITHUB_OUTPUT"
+
+      - name: No release changes
+        if: steps.plan.outputs.release != 'true'
+        run: echo 'No feat, fix, perf, or breaking change; nothing will be built or published.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install verified actionlint
+        if: steps.plan.outputs.release == 'true'
+        run: |
+          actionlint_bin="$(./tools/install-actionlint.sh "$RUNNER_TEMP/actionlint")"
+          echo "ACTIONLINT_BIN=$actionlint_bin" >> "$GITHUB_ENV"
+
+      - name: Repository and host checks
+        if: steps.plan.outputs.release == 'true'
+        run: ./tools/validate.sh --static
+
+      - name: Restore compiler cache
+        if: steps.plan.outputs.release == 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .ccache
+          key: badge-idf553-${{ runner.os }}-${{ github.sha }}
+          restore-keys: badge-idf553-${{ runner.os }}-
+
+      - name: Build and verify ESP32-C3 firmware and native LVGL
+        if: steps.plan.outputs.release == 'true'
+        uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d # v1
+        with:
+          esp_idf_version: v5.5.3
+          target: esp32c3
+          extra_docker_args: >-
+            -e BADGE_VERSION=${{ steps.plan.outputs.version }}
+            -e CCACHE_DIR=/app/${{ github.repository }}/.ccache
+            -e IDF_CCACHE_ENABLE=1
+          command: |
+            command -v cmake
+            command -v ninja
+            ./tools/validate.sh --firmware
+            python3 tools/release_badge.py package --plan build/release-plan.json --output build/release-assets
+
+      - name: Upload public release files
+        if: steps.plan.outputs.release == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: badge-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/release-assets/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: needs.build.outputs.release == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified public files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release
+
+      - name: Create immutable tag and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_SHA: ${{ needs.build.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          cd release
+          sha256sum --check SHA256SUMS.txt
+          test "$RELEASE_SHA" = "$GITHUB_SHA"
+          # Re-run only an unfinished draft for this exact commit; never move tags.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" > tag.json; then
+            python3 - "$RELEASE_SHA" <<'PYTAG'
+          import json, sys
+          ref = json.load(open("tag.json"))["object"]
+          if ref["type"] != "commit" or ref["sha"] != sys.argv[1]:
+              raise SystemExit("Existing tag has a different target or is not a lightweight release tag")
+          PYTAG
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA"
+          fi
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft > release-state.json; then
+            python3 -c 'import json; assert json.load(open("release-state.json"))["isDraft"], "Published releases are immutable"'
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft --verify-tag --target "$RELEASE_SHA" \
+              --title "GitHub Pixel Passport $RELEASE_TAG" --notes-file release-notes.md
+          fi
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "github-pixel-passport-v$RELEASE_VERSION-app.bin" \
+            "github-pixel-passport-v$RELEASE_VERSION-full.bin" \
+            "github-pixel-passport-v$RELEASE_VERSION-manifest.json" \
+            SHA256SUMS.txt FLASHING.txt release-notes.md LICENSE LICENSE-FoloToy THIRD-PARTY-LICENSES.txt
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --notes-file release-notes.md

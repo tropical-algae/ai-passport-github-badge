@@ -1,0 +1,14 @@
+{
+  "converter": "lv_font_conv@1.5.3",
+  "sources": {
+    "Silkscreen-Regular.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/silkscreen/Silkscreen-Regular.ttf",
+    "NotoSansCJKsc-Regular.otf": "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf"
+  },
+  "sha256": {
+    "NotoSansCJKsc-Regular.otf": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+    "Silkscreen-Regular.ttf": "c845473330b94c2079ce9af01c51ac8ba2d99c24f4d14c039843bbb8e642ebd8",
+    "Silkscreen-LICENSE.txt": "86c5e9c9382cdcc5948704fdfe60f2aa164a719746931219a42736ecd9cefbd3",
+    "NotoSansCJK-LICENSE.txt": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+  },
+  "cjk_range": "0x20-0x24F,0x370-0x52F,0x2000-0x206F,0x3000-0x30FF,0x3400-0x9FFF,0xFF00-0xFFEF"
+}

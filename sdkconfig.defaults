@@ -1,0 +1,54 @@
+# --- 目标芯片 ---
+CONFIG_IDF_TARGET="esp32c3"
+# 注:ESP32-C3 无 PSRAM,故不设 CONFIG_SPIRAM。
+
+# --- Flash ---
+# FoloToy AI Passport 当前产品/固件基线使用 8MB Flash。
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# 固定 8MB 镜像头，关闭 detect，便于 idf.py merge-bin。
+CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=n
+# 默认模板只保留 NVS、PHY data 和占用剩余空间的 factory app；用户可按需修改。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# --- 控制台:USB-Serial-JTAG(C3 原生 USB,GPIO18/19)---
+# 不用 UART0:其默认 TX=GPIO21 与本板背光引脚冲突。
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- LVGL ---
+CONFIG_LV_COLOR_DEPTH_16=y
+# 20 ms display refresh period targets up to 50 FPS when rendering and SPI
+# transfer complete within the same budget.
+CONFIG_LV_DEF_REFR_PERIOD=20
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+# Share IDF's thread-safe heap: reserving a 64 KiB idle LVGL pool would starve TLS.
+# Native rendering tests separately measure PNG/JPEG and QR transient allocations.
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_CACHE_DEF_SIZE=16384
+
+# --- 系统 ---
+CONFIG_FREERTOS_HZ=1000
+# First-boot QR creation probes TJPGD even for an I1 canvas. Its info callback
+# has a 4272-byte frame in the ESP32-C3 build; the default main stack overflows.
+# This startup-only stack is freed when app_main returns (IDF adds 512 bytes).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# --- GitHub badge: Wi-Fi, local provisioning, offline assets ---
+CONFIG_BT_ENABLED=n
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_LV_USE_QRCODE=y
+CONFIG_LV_USE_LODEPNG=y
+CONFIG_LV_USE_TJPGD=y
+CONFIG_LV_USE_FS_MEMFS=y
+CONFIG_LV_FS_MEMFS_LETTER=77
+CONFIG_LV_TXT_ENC_UTF8=y
+CONFIG_LV_USE_FONT_PLACEHOLDER=y
+CONFIG_SPIFFS_OBJ_NAME_LEN=64
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
