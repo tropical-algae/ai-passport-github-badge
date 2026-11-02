@@ -82,7 +82,7 @@ The badge reads **public GitHub REST API data**, without a token. Anonymous quot
 
 - **ACTIVITY is observed public events**, including PushEvent frequency. It is not GitHub's contribution calendar or a count of commits. The 24-week grid preserves unknown history and accumulates observations over time.
 - **Starred repositories and gists are bounded samples** of the first 100 fetched entries. PR/issue statistics come from public search; incomplete responses are marked partial.
-- **Avatars are cached locally.** Rendering never depends on a live image URL. An unavailable or unsupported avatar uses a placeholder.
+- **Avatars are cached locally.** Baseline JPEG and PNG with up to 8 bits per channel are supported, including transparency, palette, grayscale and Adam7 PNGs. 16-bit PNG, progressive JPEG, GIF and WebP are safely rejected. Rendering never fetches a live image URL; a failed replacement retains a valid avatar, or shows a placeholder if none exists.
 - **Networking is direct to GitHub and its avatar CDN.** Connectivity from mainland China or restricted networks may be unreliable. Failed requests keep cached data available; the firmware does not include a proxy service.
 
 See the [application guide](docs/development/github-badge.md) for data coverage, storage behavior and resource limits.

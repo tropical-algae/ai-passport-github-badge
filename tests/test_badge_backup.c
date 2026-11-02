@@ -194,9 +194,77 @@ static void backup_empty_snapshot_tests(void) {
     assert(archive->length == 0 && !busy); assert_file(path, "corrupt snapshot");
     free(archive);
 }
+static void backup_avatar_format_tests(void) {
+    /* Complete one-pixel PNGs with valid IHDR/IDAT CRCs and zlib payloads.
+     * RGB16/RGBA16 must be refused before a restored avatar can reach LVGL. */
+    static const unsigned char rgb16[] = {
+        0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,
+        0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+        0x10,0x02,0x00,0x00,0x00,0xc0,0xe7,0x8f,0x9d,0x00,0x00,0x00,
+        0x0f,0x49,0x44,0x41,0x54,0x78,0x9c,0x63,0xf8,0xff,0x9f,0x81,
+        0x41,0xc8,0x04,0x00,0x0b,0x54,0x02,0x45,0x9b,0x62,0x9c,0xe1,
+        0x00,0x00,0x00,0x00,0x49,0x45,0x4e,0x44,0xae,0x42,0x60,0x82,
+    };
+    static const unsigned char rgba16[] = {
+        0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,
+        0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+        0x10,0x06,0x00,0x00,0x00,0x4f,0x85,0x18,0xca,0x00,0x00,0x00,
+        0x11,0x49,0x44,0x41,0x54,0x78,0x9c,0x63,0xf8,0xff,0x9f,0x81,
+        0x41,0xc8,0xe4,0xff,0x7f,0x00,0x12,0xdb,0x04,0x43,0x9f,0xee,
+        0xca,0x99,0x00,0x00,0x00,0x00,0x49,0x45,0x4e,0x44,0xae,0x42,
+        0x60,0x82,
+    };
+    static const unsigned char rgba8[] = {
+        0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,
+        0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+        0x08,0x06,0x00,0x00,0x00,0x1f,0x15,0xc4,0x89,0x00,0x00,0x00,
+        0x0d,0x49,0x44,0x41,0x54,0x78,0x9c,0x63,0xf8,0xcf,0x20,0xf4,
+        0x1f,0x00,0x05,0x24,0x02,0x11,0xad,0xdd,0x4e,0xef,0x00,0x00,
+        0x00,0x00,0x49,0x45,0x4e,0x44,0xae,0x42,0x60,0x82,
+    };
+    badge_config_t current, incoming, loaded;
+    badge_config_defaults(&current); strcpy(current.username, "keep-avatar-state");
+    strcpy(current.ssid, "existing wifi"); current.theme = 3; current.screen_timeout_min = 60;
+    assert(badge_storage_activate(&current, 1000));
+    badge_data_t data; badge_data_reset(&data, current.username); data.followers = 999;
+    assert(badge_data_save(&data));
+    incoming = current; strcpy(incoming.username, "imported-avatar");
+    strcpy(incoming.ssid, "imported wifi"); incoming.screen_timeout_min = 1;
+    badge_data_reset(&data, incoming.username); data.valid = BADGE_AVATAR;
+    transport_t *archive = calloc(1, sizeof(*archive)); assert(archive);
+    backup_header_t *header = (void *)archive->bytes;
+    *header = (backup_header_t){.magic = {'G','H','B','K','0','0','0','1'},
+        .config_size = sizeof(incoming), .data_size = sizeof(data)};
+    memcpy(archive->bytes + sizeof(*header), &incoming, sizeof(incoming));
+    memcpy(archive->bytes + sizeof(*header) + sizeof(incoming), &data, sizeof(data));
+    const unsigned char *images[] = {rgb16, rgba16, rgba8};
+    const size_t lengths[] = {sizeof(rgb16), sizeof(rgba16), sizeof(rgba8)};
+    size_t avatar_offset = sizeof(*header) + sizeof(incoming) + sizeof(data);
+    char error[120];
+    for (unsigned i = 0; i < 3; ++i) {
+        header->avatar_size = (uint32_t)lengths[i];
+        memcpy(archive->bytes + avatar_offset, images[i], lengths[i]);
+        archive->length = avatar_offset + lengths[i];
+        recalc(archive); reset_transfer(archive);
+        if (i < 2) {
+            assert(!badge_backup_restore(receive_bytes, archive, archive->length, error, sizeof(error)));
+            assert(!busy && !ended_restored);
+            assert(!strcmp(error, "BACKUP CHECKSUM OR CONTENT INVALID"));
+            check_old(&current, 1000);
+            assert(badge_storage_namespace_empty(1001, incoming.username));
+        } else {
+            /* The same archive and transaction accept a supported PNG. */
+            assert(badge_backup_restore(receive_bytes, archive, archive->length, error, sizeof(error)));
+            assert(!busy && ended_restored && badge_storage_namespace() == 1001);
+            assert(badge_config_load(&loaded) && !memcmp(&loaded, &incoming, sizeof(loaded)));
+            assert(badge_data_load(incoming.username, &data) && (data.valid & BADGE_AVATAR));
+        }
+    }
+    free(archive);
+}
 int main(void) {
     snprintf(test_directory, sizeof(test_directory), "/tmp/github-badge-backup-XXXXXX"); assert(mkdtemp(test_directory));
-    mount_tests(); config_tests(); replacement_tests(); snapshot_tests(); retired_namespace_tests(); backup_tests(); backup_empty_snapshot_tests();
+    mount_tests(); config_tests(); replacement_tests(); snapshot_tests(); retired_namespace_tests(); backup_tests(); backup_empty_snapshot_tests(); backup_avatar_format_tests();
     DIR *directory = opendir(test_directory); assert(directory); struct dirent *entry;
     while ((entry = readdir(directory)) != NULL) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;

@@ -18,4 +18,5 @@ for fixture in avatar.png avatar64.png avatar64.jpg avatar-progressive.jpg avata
         (cd "$run_dir" && "$output/build/badge_ui_render" "$output/fixtures/$fixture")
     fi
 done
+python3 "$repo_root/tests/ui_render/check_png_formats.py" "$output/build/badge_ui_render" "$output/fixtures" "$output/png-formats"
 printf 'Native LVGL previews and avatar/font checks: %s\n' "$output"

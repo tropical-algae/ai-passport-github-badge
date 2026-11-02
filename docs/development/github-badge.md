@@ -69,7 +69,7 @@ Requests go directly to GitHub and its avatar CDN. Restricted networks, includin
 | PR/issue statistics | Authored-by-user searches across public repositories. `incomplete_results` marks partial statistics. Closed PRs exclude merged PRs in the distribution; merge rate uses all PRs. |
 | Starred/gists | First 100 entries per endpoint, with sample/count labels and partial flags when capped; two entries are retained for detail display. |
 | Timeline | Six recent public events, sharing activity collection. |
-| Avatars | HTTPS `avatars.githubusercontent.com` only, no redirects; at most 24 KiB and 64 × 64 pixels. PNG and baseline JPEG are supported. Unsupported or corrupt images fall back to the placeholder when no valid avatar exists. |
+| Avatars | HTTPS `avatars.githubusercontent.com` only, no redirects; at most 24 KiB and 64 × 64 pixels. Baseline JPEG and PNG up to 8 bits per channel are supported, including RGB/RGBA, palette, grayscale, transparency and Adam7 interlacing. 16-bit PNG, progressive JPEG, GIF and WebP are safely rejected. Unsupported or corrupt images fall back to the placeholder when no valid avatar exists. |
 
 GitHub's event timeline exposes at most 300 events from the past 30 days. Missing older history and gaps from offline periods or result caps remain unknown or partial; a 24-week layout does not imply a 24-week server history. See [GitHub event limits](https://docs.github.com/en/rest/activity/events#about-github-events).
 
@@ -84,6 +84,8 @@ The encoded avatar is stored in Flash for offline use. The app reads and decodes
 A failed decode preserves an existing valid avatar and can be retried later; changing accounts clears the previous avatar. Rendering draws the owned pixels without downloading or repeatedly decoding the image. The opaque pixel buffer costs 5,832 bytes; optional alpha adds 2,916 bytes. Decode scratch state is heap allocated to protect the small application stack.
 
 LVGL shares the normal IDF heap instead of reserving an idle fixed pool. The BSP uses one 240 × 40 RGB565 DMA display buffer. Network, portal and avatar-decoding peaks are separated; no PSRAM is assumed. Successful native allocation tests cannot establish real-device heap/stack margins.
+
+The shared avatar gate validates the complete PNG IHDR, permitted color/bit-depth combinations, compression/filter methods and interlace mode before downloading to cache, accepting a backup, or invoking the UI decoder. The pinned LVGL 9.5.0 LodePNG adapter's `decodeGeneric()` allocates a four-byte-per-pixel buffer before `postProcessScanlines()` writes source-format pixels; RGB16/RGBA16 need six/eight bytes per pixel. Rejecting all 16-bit PNGs at the shared gate prevents that unsafe path without a vendor patch. Pixel-comparison fixtures cover accepted PNG formats; sanitizer regressions verify that 16-bit RGB/RGBA never reach the decoder.
 
 ## Persistence, backup and flashing
 

@@ -104,7 +104,16 @@ bool badge_avatar_dimensions(const void *bytes, size_t size, unsigned *width, un
     const uint8_t *p = bytes;
     if (!p || !width || !height || size > 24 * 1024 || size < 24) return false;
     if (!memcmp(p, "\x89PNG\r\n\x1a\n", 8)) {
-        if (be32(p + 8) != 13 || memcmp(p + 12, "IHDR", 4)) return false;
+        if (size < 33 || be32(p + 8) != 13 || memcmp(p + 12, "IHDR", 4)) return false;
+        /* LVGL 9.5.0's LodePNG adapter allocates four bytes per pixel before
+         * unfiltering the source. RGB/RGBA16 would write six/eight bytes there.
+         * All callers (download, cache, backup and direct UI decode) share this
+         * gate. Limit PNG to valid <=8-bit color modes before any decoder runs. */
+        unsigned depth = p[24], color = p[25];
+        bool depth_ok = depth == 1 || depth == 2 || depth == 4 || depth == 8;
+        bool color_ok = color == 0 || color == 3 ||
+            (depth == 8 && (color == 2 || color == 4 || color == 6));
+        if (!depth_ok || !color_ok || p[26] != 0 || p[27] != 0 || p[28] > 1) return false;
         *width = be32(p + 16); *height = be32(p + 20);
     } else if (p[0] == 0xff && p[1] == 0xd8) {
         size_t at = 2;

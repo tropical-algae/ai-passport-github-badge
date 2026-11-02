@@ -167,7 +167,8 @@ int main(int argc,char **argv) {
     if(avatar_file) {
         size_t size=fread(avatar_bytes,1,sizeof(avatar_bytes),avatar_file);fclose(avatar_file);
         bool loaded=badge_ui_set_avatar(avatar_bytes,size);printf("avatar decoded: %s\n",loaded?"yes":"no");
-        if(argc<3)assert(loaded);else assert(!loaded);
+        bool reject=argc>2 && !strcmp(argv[2],"reject");
+        if(reject)assert(!loaded);else assert(loaded);
         if(loaded) {
             save("avatar-owned-pixels");uint32_t picture=frame_hash();
             if(argc>1 && strstr(argv[1],"/avatar64.jpg")) {
@@ -215,6 +216,10 @@ int main(int argc,char **argv) {
             assert(!badge_ui_set_avatar(avatar_bytes,size));lv_refr_now(display);assert(frame_hash()==picture);
             if(argc>1 && (strstr(argv[1],"/avatar.png") || strstr(argv[1],"/avatar64.jpg")))assert_icon_avatar();
         }
+    }
+    if(argc>3 && !strcmp(argv[3],"avatar-only")) {
+        puts("native avatar checks passed");
+        return 0;
     }
     for(unsigned i=0;i<7;i++) {char name[32];snprintf(name,sizeof(name),"page-%u",i);save(name);badge_ui_key(BADGE_KEY_DOWN,true);}
     for(unsigned i=0;i<4;i++)badge_ui_key(BADGE_KEY_DOWN,true);

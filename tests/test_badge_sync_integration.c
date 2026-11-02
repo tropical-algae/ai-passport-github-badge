@@ -104,7 +104,7 @@ esp_err_t esp_http_client_open(esp_http_client_handle_t c, int write_len)
     } else if (strstr(c->url, "https://avatars.githubusercontent.com/u/42?s=54")) {
         ++avatar_requests; avatar_serial = request_serial;
         /* The transport accepts a bounded PNG; UI decoding is a separate test. */
-        const unsigned char png[32] = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,54,0,0,0,54};
+        const unsigned char png[33] = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,54,0,0,0,54,8,6};
         memcpy(c->payload, png, sizeof(png)); c->length = sizeof(png);
     } else if (!strcmp(c->url, "https://api.github.com/users/tester")) {
         ++profiles;

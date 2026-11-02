@@ -44,8 +44,28 @@ int main(void)
     assert(!badge_iso_day("2023-02-29", &day));
     assert(!badge_iso_day("2024-13-01", &day));
     unsigned w, h;
-    unsigned char png[32] = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,54,0,0,0,54};
+    unsigned char png[33] = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,54,0,0,0,54,8,6};
     assert(badge_avatar_dimensions(png, sizeof(png), &w, &h) && w == 54 && h == 54);
+    for (size_t length = 24; length < sizeof(png); ++length)
+        assert(!badge_avatar_dimensions(png, length, &w, &h));
+    /* The gate accepts only the PNG specification's <=8-bit combinations.
+     * In particular RGB/RGBA16 must never reach the LVGL decoder's undersized
+     * source buffer, including through backup/cache/direct UI callers. */
+    for (unsigned depth = 0; depth <= 32; ++depth) for (unsigned color = 0; color <= 7; ++color) {
+        bool valid = (depth == 1 || depth == 2 || depth == 4 || depth == 8) &&
+            (color == 0 || color == 3 || (depth == 8 && (color == 2 || color == 4 || color == 6)));
+        png[24] = (unsigned char)depth; png[25] = (unsigned char)color;
+        assert(badge_avatar_dimensions(png, sizeof(png), &w, &h) == valid);
+    }
+    png[24] = 8; png[25] = 6;
+    png[28] = 1; /* Adam7 is supported. */
+    assert(badge_avatar_dimensions(png, sizeof(png), &w, &h));
+    png[28] = 0;
+    for (unsigned at = 26; at <= 28; ++at) {
+        png[at] = 2;
+        assert(!badge_avatar_dimensions(png, sizeof(png), &w, &h));
+        png[at] = 0;
+    }
     png[19] = 255;
     assert(!badge_avatar_dimensions(png, sizeof(png), &w, &h));
     const unsigned char jpg[] = {255,216,255,224,0,4,0,0,255,192,0,17,8,0,54,0,54,3,1,0x11,0,2,0x11,0,3,0x11,0,255,217};
