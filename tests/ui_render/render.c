@@ -126,9 +126,15 @@ static void assert_battery_gap(void) {
 }
 static void fill_data(void) {
     badge_config_defaults(&config);strcpy(config.username,"pixeldev");config.utc_offset_min=480;
+    const char *preview_username=getenv("BADGE_PREVIEW_USERNAME");
+    if(preview_username && *preview_username) {
+        assert(badge_username_valid(preview_username));
+        snprintf(config.username,sizeof(config.username),"%s",preview_username);
+    }
     badge_data_reset(&data,config.username);
     data.valid=0x1ff;data.complete=0x1ff;
     strcpy(data.name,"Pixel Developer");strcpy(data.company,"OPEN SOURCE");strcpy(data.location,"EARTH");strcpy(data.blog,"example.dev");strcpy(data.joined,"2020-04-08");
+    if(preview_username && *preview_username)snprintf(data.name,sizeof(data.name),"%s",preview_username);
     data.public_repos=18;data.followers=1284;data.following=76;data.public_gists=7;
     data.repo_count=5;data.repos_fetched=18;
     const char *names[]={"pixel-terminal","retro-dashboard","tiny-os","api-client","color-kit"};
@@ -149,7 +155,7 @@ static void fill_data(void) {
     data.gist_count=2;data.gists_fetched=7;data.gists_public=7;strcpy(data.gists[0].description,"Pixel display notes");strcpy(data.gists[0].updated_at,"2026-10-23");strcpy(data.gists[1].description,"API client setup");strcpy(data.gists[1].updated_at,"2026-10-21");
     data.event_count=6;
     const char *types[]={"PushEvent","PullRequestEvent","IssuesEvent","CreateEvent","WatchEvent","ForkEvent"};
-    for(unsigned i=0;i<6;i++){strcpy(data.events[i].type,types[i]);snprintf(data.events[i].repo,sizeof(data.events[i].repo),"pixeldev/%s",names[i%5]);strcpy(data.events[i].date,"2026-10-28");}
+    for(unsigned i=0;i<6;i++){strcpy(data.events[i].type,types[i]);snprintf(data.events[i].repo,sizeof(data.events[i].repo),"%s/%s",config.username,names[i%5]);strcpy(data.events[i].date,"2026-10-28");}
     data.last_success=status.now-3600;
 }
 int main(int argc,char **argv) {

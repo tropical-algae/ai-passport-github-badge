@@ -34,7 +34,7 @@ emoji）保留可见的缺字方框。源地址、SHA-256 和 Unicode 范围见
 
 | 文件 | 尺寸与格式 | 用途与来源 |
 | --- | --- | --- |
-| [`images/github-badge-pages.png`](images/github-badge-pages.png) | 1080 × 712，PNG RGB | 使用合成数据的七页原生 C/LVGL 铭牌视图，为中英文项目 README 拼合。由本项目 UI 生成，按项目许可证分发；这是软件预览，不是硬件实拍。 |
+| [`images/github-badge-pages.png`](images/github-badge-pages.png) | 1080 × 712，PNG RGB | 使用所有者提供的 tropical-algae 名称及合成统计/头像的七页原生 C/LVGL 铭牌视图，为中英文项目 README 拼合。由本项目 UI 生成，按项目许可证分发；这是软件预览，不是硬件实拍。 |
 | [`images/home.jpg`](images/home.jpg) | 3840 × 2160，JPEG | 上游 AI Passport 产品图，保留在 `docs/README.md` 及对应中文版的硬件平台文档中。 |
 | [`images/readme-hardware-specs.png`](images/readme-hardware-specs.png) | 2172 × 724，PNG RGBA | 保留为可选技术参考图，不再用于首页主视觉。于 2026-09-17 使用内置图像生成工具为本仓库生成；已根据文档中的硬件能力契约核对图中的六项标签与参数。 |
 | [`images/logo-wordmark.png`](images/logo-wordmark.png) | 1648 × 336，PNG RGBA | 从上游仓库原始 `images/logo.png` 裁切并去除背景的黑色字标；保留在平台文档中用于浅色主题。 |
@@ -43,13 +43,15 @@ emoji）保留可见的缺字方框。源地址、SHA-256 和 Unicode 范围见
 激活构建环境后，在仓库根目录重新生成铭牌拼图：
 
 ```bash
-./tools/render_badge_ui.sh build/github-ui-preview
+BADGE_PREVIEW_USERNAME=tropical-algae ./tools/render_badge_ui.sh build/github-ui-preview
 python3 tools/compose_badge_preview.py build/github-ui-preview/avatar assets/images/github-badge-pages.png
 ```
 
 合成数据与生成头像来自 `tests/ui_render/render.c` 和
 `tests/ui_render/fixtures.py`。拼图脚本仅使用 Python 标准库，将每个 240 × 320
-页面按原始像素尺寸排列。图片不含下载的个人账号数据、真实头像或配网二维码秘密。
+页面按原始像素尺寸排列。图中使用所有者提供的 `tropical-algae` 名称，
+其余数据与头像均为合成示例，不含下载的账号数据或配网二维码秘密。
+省略 `BADGE_PREVIEW_USERNAME` 时使用默认的 `pixeldev` 测试数据。
 
 - 使用描述性命名，并记录尺寸、像素格式、转换步骤与目标路径。
 - 优先采用适合 240 × 320 RGB565 显示的格式，并纳入 Flash 与内部 RAM 考量。

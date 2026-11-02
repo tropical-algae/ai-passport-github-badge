@@ -39,7 +39,7 @@ Store reusable source images and generated display assets in `images/`.
 
 | File | Dimensions and format | Use and source |
 | --- | --- | --- |
-| [`images/github-badge-pages.png`](images/github-badge-pages.png) | 1080 × 712, PNG RGB | Seven native C/LVGL badge views with synthetic data, composed for the English/Chinese project README. Generated from this project's UI; distributed under the project license. This is a software preview, not a hardware photograph. |
+| [`images/github-badge-pages.png`](images/github-badge-pages.png) | 1080 × 712, PNG RGB | Seven native C/LVGL badge views using the owner-provided tropical-algae name and synthetic statistics/avatar, composed for the English/Chinese project README. Generated from this project's UI; distributed under the project license. This is a software preview, not a hardware photograph. |
 | [`images/home.jpg`](images/home.jpg) | 3840 × 2160, JPEG | Upstream AI Passport product image retained in the hardware platform documentation at `docs/README.md` and its Chinese pair. |
 | [`images/readme-hardware-specs.png`](images/readme-hardware-specs.png) | 2172 × 724, PNG RGBA | Optional technical infographic retained as a reference asset; it is no longer used as the homepage hero. Generated for this repository with the built-in image generation tool on 2026-09-17; the six labels and values were checked against the documented hardware contract. |
 | [`images/logo-wordmark.png`](images/logo-wordmark.png) | 1648 × 336, PNG RGBA | Transparent black wordmark extracted from the upstream repository's original `images/logo.png`; retained in the platform documentation for light backgrounds. |
@@ -48,14 +48,16 @@ Store reusable source images and generated display assets in `images/`.
 Regenerate the badge collage from the repository root after activating the build environment:
 
 ```bash
-./tools/render_badge_ui.sh build/github-ui-preview
+BADGE_PREVIEW_USERNAME=tropical-algae ./tools/render_badge_ui.sh build/github-ui-preview
 python3 tools/compose_badge_preview.py build/github-ui-preview/avatar assets/images/github-badge-pages.png
 ```
 
 The fixture data and generated avatar come from `tests/ui_render/render.c` and
 `tests/ui_render/fixtures.py`. The composition script uses only Python's standard
 library and places each 240 × 320 page at its original pixel size. The image
-contains no downloaded personal account data, real avatar or setup QR secret.
+uses the owner-provided `tropical-algae` name; all remaining data and the avatar
+are synthetic. It contains no downloaded account data or setup QR secret.
+Omit `BADGE_PREVIEW_USERNAME` to retain the default `pixeldev` test fixture.
 
 - Use descriptive names and document dimensions, pixel format, conversion steps, and destination.
 - Prefer formats suitable for the 240 × 320 RGB565 display and account for Flash and internal RAM.

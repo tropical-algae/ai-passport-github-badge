@@ -13,7 +13,7 @@
 把 AI Passport 变成一张个人 GitHub 铭牌：选择公开账号，连接 Wi-Fi，随身展示身份、项目与活动。通过二维码分享主页，断网后仍可浏览已经缓存的数据。
 
 <p align="center"><img src="assets/images/github-badge-pages.png" alt="七个像素终端页面：身份、仓库、语言、活动、PR 与 Issue、Stars 与 Gists、时间线" width="1080"></p>
-<p align="center"><sub>由固件实际 C/LVGL 界面配合合成数据进行本机渲染。这是软件预览，并非设备实拍。</sub></p>
+<p align="center"><sub>由固件实际 C/LVGL 界面以 tropical-algae 名称进行本机渲染。统计与生成头像为示例数据，并非账号实际数据或设备实拍。</sub></p>
 
 ## 功能
 
@@ -96,7 +96,7 @@
 ./tools/validate.sh             # 完整检查、固件构建与镜像验证
 
 # 用合成数据渲染实际界面
-./tools/render_badge_ui.sh build/github-ui-preview
+BADGE_PREVIEW_USERNAME=tropical-algae ./tools/render_badge_ui.sh build/github-ui-preview
 python3 tools/compose_badge_preview.py build/github-ui-preview/avatar assets/images/github-badge-pages.png
 ```
 

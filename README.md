@@ -13,7 +13,7 @@
 Turn an AI Passport into a personal GitHub badge: choose a public account, connect to Wi-Fi, and carry its profile, projects and activity with you. Share the profile through a QR code; keep browsing cached data when the network disappears.
 
 <p align="center"><img src="assets/images/github-badge-pages.png" alt="Seven pixel-terminal pages: profile, repositories, languages, activity, pull requests and issues, stars and gists, and timeline" width="1080"></p>
-<p align="center"><sub>Actual firmware UI rendered with native C/LVGL and synthetic data. This is a software preview, not a device photograph.</sub></p>
+<p align="center"><sub>Actual firmware UI rendered with native C/LVGL using the tropical-algae name and illustrative data. Statistics and the generated avatar are synthetic; this is not a device photograph.</sub></p>
 
 ## Features
 
@@ -96,7 +96,7 @@ Use **ESP-IDF 5.5.3**, Python 3, Node.js and a host C compiler. Follow the [envi
 ./tools/validate.sh             # complete gate, firmware build and image verification
 
 # Render the real interface with synthetic data
-./tools/render_badge_ui.sh build/github-ui-preview
+BADGE_PREVIEW_USERNAME=tropical-algae ./tools/render_badge_ui.sh build/github-ui-preview
 python3 tools/compose_badge_preview.py build/github-ui-preview/avatar assets/images/github-badge-pages.png
 ```
 
