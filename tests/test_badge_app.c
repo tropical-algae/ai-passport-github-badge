@@ -261,7 +261,10 @@ static void reset_fixture(void)
     test_queue_count = test_sem_count = test_task_creates = test_cancel_calls = 0;
     test_ap_starts = test_ap_stops = test_saves = test_data_saves = test_sync_calls = 0;
     test_backlight_writes = test_lvgl_locks = 0;
-    test_ap_active = test_stop_queued = test_start_queued = test_task_failure = false;
+    test_ap_active = false;
+    test_stop_queued = 0;
+    test_start_queued = 0;
+    test_task_failure = false;
     test_running_app = test_running_worker = false;
     test_step_hook = NULL;
     test_notification[0] = 0;
