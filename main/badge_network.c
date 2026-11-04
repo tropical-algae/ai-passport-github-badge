@@ -365,12 +365,22 @@ static void end_backup(bool reboot)
 
 /* Per-socket timeouts alone can be kept alive by a trickling upload. Bound the
  * whole transfer so maintenance mode cannot freeze controls indefinitely. */
-typedef struct { httpd_req_t *request; size_t transferred, remaining; int64_t deadline; } backup_http_t;
+typedef struct { httpd_req_t *request; size_t transferred, remaining; int64_t deadline; bool started; } backup_http_t;
 
 static bool backup_write(const void *data, size_t length, void *context)
 {
     backup_http_t *transfer = context;
     const char *bytes = data;
+    if (!transfer->started) {
+        /* Validation failures must remain JSON errors, not attachment files.
+         * Once streaming begins, even a failed first chunk must close the
+         * response rather than append JSON to a partially written backup. */
+        transfer->started = true;
+        response_headers(transfer->request);
+        if (httpd_resp_set_type(transfer->request, "application/octet-stream") != ESP_OK ||
+            httpd_resp_set_hdr(transfer->request, "Content-Disposition",
+                               "attachment; filename=github-badge-backup.bin") != ESP_OK) return false;
+    }
     while (length) {
         if (milliseconds() >= transfer->deadline) return false;
         size_t chunk = length > 1024 ? 1024 : length;
@@ -400,16 +410,13 @@ static esp_err_t portal_backup(httpd_req_t *request)
     if (!request_nonce_valid(request)) return json_message(request, "403 Forbidden", "Setup session expired. Reload this page.");
     if (request->content_len) return json_message(request, "400 Bad Request", "Backup request must have no body.");
     if (!begin_backup()) return json_message(request, "409 Conflict", "Wait until the current operation finishes.");
-    response_headers(request);
-    httpd_resp_set_type(request, "application/octet-stream");
-    httpd_resp_set_hdr(request, "Content-Disposition", "attachment; filename=github-badge-backup.bin");
     backup_http_t transfer = {.request = request, .deadline = milliseconds() + 30000};
     char error[160] = "Backup failed. Please retry.";
     bool success = badge_backup_export(backup_write, &transfer, error, sizeof(error));
     esp_err_t result;
     if (success) result = httpd_resp_send_chunk(request, NULL, 0);
     /* Do not terminate a partial backup successfully; the client must reject it. */
-    else if (transfer.transferred) result = ESP_FAIL;
+    else if (transfer.started) result = ESP_FAIL;
     else result = json_message(request, "500 Internal Server Error", error);
     end_backup(false);
     return result;

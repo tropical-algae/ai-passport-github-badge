@@ -14,12 +14,16 @@ class Element {
     focus() { this.focused = true; }
     click() { this.clicked = true; }
     remove() { this.removed = true; }
+    removeAttribute(name) { delete this.attributes[name]; if (name === 'href') delete this.href; }
     async fire(name) { return this.handlers[name]?.({target: this, preventDefault() {}}); }
 }
 
 async function main() {
-    const elements = Object.fromEntries(['setup', 'status', 'error', 'save', 'scan', 'scan_status', 'networks', 'ssid', 'password', 'open_network', 'username', 'interval', 'nonce', 'utc_offset', 'export', 'restore', 'restore_file', 'backup_status'].map(id => [id, new Element()]));
-    const calls = [], timers = [], body = new Element();
+    const elements = Object.fromEntries(['setup', 'status', 'error', 'save', 'scan', 'scan_status', 'networks', 'ssid', 'password', 'open_network', 'username', 'interval', 'nonce', 'utc_offset', 'export', 'backup_download', 'restore', 'restore_file', 'backup_status'].map(id => [id, new Element()]));
+    const calls = [], timers = [], body = new Element(), urls = new Map(), revoked = [], windowHandlers = {};
+    let urlSerial = 0, backupMode = 'ok';
+    const backupBytes = Buffer.concat([Buffer.from('GHBK0001'), Buffer.alloc(1226)]);
+    const window = {addEventListener(name, fn) { windowHandlers[name] = fn; }};
     const nonce = '0123456789abcdef0123456789abcdef';
     const document = {body, querySelector: selector => elements[selector.slice(1)], getElementById: id => elements[id], createElement: () => new Element()};
     class FormData {
@@ -31,17 +35,30 @@ async function main() {
         [Symbol.iterator]() { return this.entries[Symbol.iterator](); }
     }
     let restoreFail = false;
-    const context = vm.createContext({document, FormData, URLSearchParams, Date,
-        URL: {createObjectURL: () => 'blob:local-backup', revokeObjectURL() {}},
+    const context = vm.createContext({document, window, FormData, URLSearchParams, Date,
+        URL: {createObjectURL: blob => { const url = `blob:local-backup-${++urlSerial}`; urls.set(url, blob); return url; },
+            revokeObjectURL: url => { revoked.push(url); urls.delete(url); }},
         setTimeout: (fn, ms) => { timers.push({fn, ms}); },
         fetch: async (url, options = {}) => {
             calls.push({url, options});
             if (url === '/api/state') return {ok: true, json: async () => ({ssid: 'Saved', username: 'octocat', interval: 6, nonce, open: false, pending: false, saved: false, message: 'Ready'})};
             if (url === '/api/networks') return {ok: true, json: async () => ({scanning: false, message: 'Ready', networks: [{ssid: 'Cafe', rssi: -30, open: true}, {ssid: '<Private>', rssi: -60, open: false}]})};
-            if (url === '/api/backup') return {ok: true, blob: async () => ({size: 1234})};
+            if (url === '/api/backup') {
+                if (backupMode === 'network') throw new Error('Network disconnected');
+                if (backupMode === 'server') return {ok: false, json: async () => ({message: 'CACHE INCOMPLETE OR CORRUPT'})};
+                if (backupMode === 'interrupted') return {ok: true, blob: async () => { throw new Error('Incomplete response'); }};
+                const bytes = backupMode === 'empty' ? Buffer.alloc(0) : backupMode === 'oversized' ? Buffer.alloc(128 * 1024 + 1) :
+                    backupMode === 'html' ? Buffer.from('<html>Reconnect to setup Wi-Fi</html>') : backupBytes;
+                return {ok: true, blob: async () => new Blob([bytes], {type: 'application/octet-stream'})};
+            }
             return {ok: !restoreFail, json: async () => ({message: restoreFail ? 'Invalid backup; existing data retained.' : 'Accepted'})};
         }});
     const html = fs.readFileSync(path.join(__dirname, '../main/badge_portal.html'), 'utf8');
+    const downloadTag = html.match(/<a id="backup_download"[^>]*>/)?.[0];
+    assert(downloadTag, 'The prepared backup needs a persistent, user-clickable save link');
+    elements.backup_download.download = downloadTag.match(/download="([^"]+)"/)[1];
+    elements.backup_download.hidden = /\bhidden\b/.test(downloadTag);
+    assert.equal(elements.backup_download.hidden, true);
     vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], context);
     const settle = async () => { for (let i = 0; i < 8; ++i) await new Promise(resolve => setImmediate(resolve)); };
     await settle();
@@ -82,9 +99,49 @@ async function main() {
     restoreFail = false;
     await elements.export.fire('click');
     assert.equal(calls.at(-1).url, '/api/backup');
-    assert.equal(body.children.at(-1).download, 'github-badge-backup.bin');
-    assert.equal(body.children.at(-1).clicked, true);
+    assert.equal(calls.at(-1).options.headers['X-Setup-Nonce'], nonce);
+    assert.equal(calls.at(-1).options.cache, 'no-store');
+    const download = elements.backup_download;
+    // Simulate a browser ignoring script-triggered click(): no saved-file event
+    // exists. The real user must still have a live link, without another fetch.
+    assert.equal(download.hidden, false);
+    assert.equal(download.download, 'github-badge-backup.bin');
+    assert.equal(download.clicked, true);
+    assert.equal(download.removed, undefined);
+    assert.equal(urls.size, 1);
+    assert.deepEqual(Buffer.from(await urls.get(download.href).arrayBuffer()), backupBytes);
+    assert.match(elements.backup_status.textContent, /SAVE BACKUP/);
+    assert.doesNotMatch(elements.backup_status.textContent, /Backup downloaded/i);
+    const beforeSave = calls.length, firstUrl = download.href;
+    await download.fire('click');
+    assert.equal(calls.length, beforeSave);
+    assert.equal(download.href, firstUrl);
+    assert.equal(urls.has(firstUrl), true);
+    assert.equal(timers.some(timer => timer.ms === 60000), false); // Do not expire a visible save link.
+    await elements.export.fire('click');
+    assert(revoked.includes(firstUrl));
+    assert.equal(urls.size, 1); // Re-export releases the earlier password-bearing Blob.
+    for (const mode of ['server', 'network', 'interrupted', 'empty', 'oversized', 'html']) {
+        backupMode = mode;
+        await elements.export.fire('click');
+        assert.equal(download.hidden, true, mode);
+        assert.equal(urls.size, 0, mode);
+        assert.equal(download.href, undefined, mode);
+        assert.equal(elements.save.disabled, false, mode);
+        assert.equal(elements.export.disabled, false, mode);
+        assert.doesNotMatch(elements.backup_status.textContent, /Backup downloaded/i);
+    }
+    backupMode = 'ok';
+    await elements.export.fire('click');
+    const lastUrl = download.href;
+    windowHandlers.pagehide();
+    assert(revoked.includes(lastUrl));
+    assert.equal(download.hidden, true);
+    assert.equal(urls.size, 0);
+    await elements.export.fire('click');
     await elements.restore.fire('click');
+    assert.equal(download.hidden, true);
+    assert.equal(urls.size, 0);
     assert.equal(elements.save.disabled, true);
     assert.equal(elements.restore.disabled, true);
     assert(timers.some(timer => timer.ms === 3500));

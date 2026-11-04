@@ -3,6 +3,7 @@
 <title>GitHub Badge / Setup</title>
 <style>
 :root{color-scheme:dark;--accent:#2ee4a4;--bg:#080f0b;--panel:#102018;--muted:#91a99a}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf8f1;font:14px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace}main{max-width:520px;margin:auto;padding:26px 20px}header{border-bottom:2px solid var(--accent);padding-bottom:16px;margin-bottom:22px;color:var(--accent);letter-spacing:2px}h1{font-size:22px;margin:4px 0}small,p.note{color:var(--muted);font-size:12px}label{display:block;margin:18px 0 5px;font-size:12px;letter-spacing:1px}input{width:100%;padding:12px;border:1px solid #345442;border-radius:0;background:var(--panel);color:inherit;font:inherit}input:focus{outline:2px solid var(--accent);outline-offset:2px}.check{display:flex;gap:10px;align-items:center;letter-spacing:0}.check input{width:18px;height:18px;accent-color:var(--accent)}button{width:100%;margin-top:24px;padding:13px;background:var(--accent);color:var(--bg);border:0;font:700 14px ui-monospace,monospace;letter-spacing:1px;cursor:pointer}button:disabled{opacity:.5;cursor:default}.secondary{background:var(--panel);color:var(--accent);border:1px solid #345442;margin-top:10px}.network{display:flex;align-items:center;justify-content:space-between;gap:10px;text-align:left;padding:10px;margin:6px 0;background:var(--panel);color:inherit;border:1px solid #345442;font-size:12px;letter-spacing:0}.network span{overflow-wrap:anywhere}.network small{white-space:nowrap;font-size:10px}.network[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}.section{margin-top:28px;padding-top:16px;border-top:1px solid #345442}h2{font-size:14px;letter-spacing:1px;color:var(--accent)}#status{margin:20px 0;padding:12px;border-left:3px solid var(--accent);background:var(--panel);overflow-wrap:anywhere}#error{color:#ffb49c}footer{margin-top:28px;font-size:11px;color:var(--muted)}a{color:var(--accent)}
+.download{display:block;padding:13px;text-align:center;text-decoration:none;font-weight:700;letter-spacing:1px}.download[hidden]{display:none}.download:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .credit{margin:20px 0 0;padding-top:14px;border-top:1px solid #345442}.credit a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 </style>
 <main><header><small>GITHUB / PERSONAL PASSPORT</small><h1>CONNECT & CONFIGURE</h1></header>
@@ -23,6 +24,8 @@
 <section class="section" aria-labelledby="backup-title"><h2 id="backup-title">LOCAL BACKUP / RESTORE</h2>
 <p class="note">Local backups include Wi-Fi passwords. 本地备份包含 Wi-Fi 密码。</p>
 <button id="export" type="button" class="secondary" disabled>EXPORT BACKUP</button>
+<a id="backup_download" class="secondary download" download="github-badge-backup.bin" hidden>SAVE BACKUP / 保存备份</a>
+<p class="note">If the setup pop-up cannot save files, open http://192.168.4.1 in Safari or Chrome while connected to this hotspot. 若配网弹窗无法保存，请在手机浏览器打开此地址。</p>
 <label for="restore_file">BACKUP FILE / MAX 128 KiB</label><input id="restore_file" type="file" accept=".bin,application/octet-stream">
 <button id="restore" type="button" class="secondary" disabled>IMPORT & RESTORE</button>
 <p class="note" lang="zh-CN">恢复备份会替换设备设置与该帐号数据，完成后重启。下方操作独立于上面的配网表单。</p>
@@ -34,10 +37,12 @@
 const form=document.querySelector('#setup'),status=document.querySelector('#status'),error=document.querySelector('#error'),save=document.querySelector('#save');
 const scanButton=document.querySelector('#scan'),scanStatus=document.querySelector('#scan_status'),networks=document.querySelector('#networks');
 const ssid=document.querySelector('#ssid'),password=document.querySelector('#password'),openNetwork=document.querySelector('#open_network');
+const backupDownload=document.querySelector('#backup_download');
 const exportButton=document.querySelector('#export'),restoreButton=document.querySelector('#restore'),restoreFile=document.querySelector('#restore_file'),backupStatus=document.querySelector('#backup_status');
+let backupUrl='';
 let loaded=false,busy=false,accepted=false,finished=false,failures=0,pending=false,scanning=false,networkKey='',restarting=false;
 document.querySelector('#utc_offset').value=-new Date().getTimezoneOffset();
-function buttons(){const disabled=!loaded||busy||pending||restarting;save.disabled=disabled;scanButton.disabled=disabled||scanning;exportButton.disabled=disabled;restoreButton.disabled=disabled||!restoreFile.files.length;restoreFile.disabled=busy||pending||restarting;}
+function buttons(){const disabled=!loaded||busy||pending||restarting;save.disabled=disabled;scanButton.disabled=disabled||scanning;exportButton.disabled=disabled;restoreButton.disabled=disabled||!restoreFile.files.length;restoreFile.disabled=busy||pending||restarting;backupDownload.hidden=!backupUrl||disabled;}
 function setOpen(value){openNetwork.checked=value;password.disabled=value;}
 openNetwork.addEventListener('change',()=>setOpen(openNetwork.checked));
 ssid.addEventListener('input',()=>{setOpen(false);networks.querySelectorAll('button').forEach(button=>button.setAttribute('aria-pressed','false'));});
@@ -76,20 +81,27 @@ form.addEventListener('submit',async e=>{e.preventDefault();if(busy||pending)ret
  }catch(e){error.textContent=e.message;}finally{busy=false;buttons();}
 });
 restoreFile.addEventListener('change',buttons);
+function clearBackup(){if(backupUrl)URL.revokeObjectURL(backupUrl);backupUrl='';backupDownload.removeAttribute('href');backupDownload.hidden=true;}
+window.addEventListener('pagehide',clearBackup);
+backupDownload.addEventListener('click',event=>{if(!backupUrl||busy||pending||restarting)event.preventDefault();});
 async function responseError(response,fallback){try{const data=await response.json();return data.message||fallback;}catch(e){return fallback;}}
 exportButton.addEventListener('click',async()=>{
- if(busy||pending||restarting)return;busy=true;buttons();backupStatus.textContent='Preparing local backup…';
+ if(!loaded||busy||pending||restarting)return;clearBackup();busy=true;buttons();backupStatus.textContent='Preparing local backup…';
  try{const response=await fetch('/api/backup',{cache:'no-store',headers:{'X-Setup-Nonce':document.querySelector('#nonce').value}});
   if(!response.ok)throw new Error(await responseError(response,'Backup failed. Please retry.'));
-  const blob=await response.blob();if(!blob.size||blob.size>128*1024)throw new Error('Invalid backup size. Please retry.');
-  const url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='github-badge-backup.bin';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
-  backupStatus.textContent='Backup downloaded. Keep this file private; it includes Wi-Fi passwords.';
- }catch(e){backupStatus.textContent=e.message;}finally{busy=false;buttons();}
+  const blob=await response.blob();if(blob.size<28||blob.size>128*1024)throw new Error('Invalid backup size. Please retry.');
+  if(await blob.slice(0,8).text()!=='GHBK0001')throw new Error('Invalid backup response. Reconnect to the badge and retry.');
+  backupUrl=URL.createObjectURL(blob);backupDownload.href=backupUrl;
+  backupStatus.textContent='Backup ready. If no download starts, tap SAVE BACKUP. Keep the file private; it includes Wi-Fi passwords. 备份已准备好；若未开始下载，请点击保存备份。';
+ }catch(e){clearBackup();backupStatus.textContent=e.message;}finally{busy=false;buttons();}
+ // A script-triggered click may be ignored by a mobile browser. Keep the same
+ // Blob link available for a real tap; never claim the browser saved the file.
+ if(backupUrl){try{backupDownload.click();}catch(e){backupDownload.focus();}}
 });
 restoreButton.addEventListener('click',async()=>{
  if(busy||pending||restarting)return;const file=restoreFile.files[0];if(!file)return;
  if(!file.size||file.size>128*1024){backupStatus.textContent='Choose a non-empty badge backup, at most 128 KiB.';return;}
- busy=true;buttons();backupStatus.textContent='Validating backup and restoring… Keep the badge powered on.';
+ clearBackup();busy=true;buttons();backupStatus.textContent='Validating backup and restoring… Keep the badge powered on.';
  try{const response=await fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Setup-Nonce':document.querySelector('#nonce').value},body:file});
   if(!response.ok)throw new Error(await responseError(response,'Restore failed. Existing data retained.'));
   const data=await response.json();restarting=true;backupStatus.textContent=data.message;
