@@ -41,6 +41,7 @@ static char test_avatar_path[64];
 static unsigned test_avatar_decodes;
 static bool test_avatar_failure;
 static bool test_fail_next_lvgl_lock, test_finish_on_status, test_save_failure;
+static bool test_backup_on_wait, test_backup_admitted;
 static void finish_worker(void);
 static jmp_buf test_app_return, test_worker_return;
 static void (*test_step_hook)(unsigned completed_steps);
@@ -74,7 +75,19 @@ BaseType_t xQueueSend(QueueHandle_t queue, const void *item, TickType_t ticks)
 }
 BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t ticks)
 {
-    (void)ticks;
+    if (queue == s_keys && ticks) {
+        assert(!s_control_lock->held); /* Waiting for input must admit HTTP work. */
+        if (test_backup_on_wait) {
+            test_backup_on_wait = false;
+            /* Simulate the HTTP task running while the app is blocked. Do not
+             * count the HTTP mutex release as an application loop iteration. */
+            bool was_running = test_running_app;
+            test_running_app = false;
+            char error[64];
+            test_backup_admitted = backup_begin(error, sizeof(error));
+            test_running_app = was_running;
+        }
+    }
     if (!queue->count) return pdFALSE;
     memcpy(item, queue->items[0], queue->item_size);
     --queue->count;
@@ -252,6 +265,7 @@ static void reset_fixture(void)
     if (test_avatar_path[0]) unlink(test_avatar_path);
     test_avatar_path[0] = 0; test_avatar_decodes = 0; test_avatar_failure = false;
     test_fail_next_lvgl_lock = test_finish_on_status = test_save_failure = false;
+    test_backup_on_wait = test_backup_admitted = false;
     memset(test_queues, 0, sizeof(test_queues));
     memset(test_sems, 0, sizeof(test_sems));
     memset(&test_worker, 0, sizeof(test_worker));
@@ -579,6 +593,18 @@ static void invalid_clock_does_not_start_fetch(void)
     assert(!test_task_creates);
 }
 
+static void backup_can_start_while_waiting_for_input(void)
+{
+    reset_fixture();
+    test_backup_on_wait = true;
+    run_app(1, NULL);
+    assert(test_backup_admitted && atomic_load(&s_maintenance));
+    assert(!test_task_creates && !s_control_lock->held);
+    backup_end(false);
+    run_app(1, NULL);
+    assert(!atomic_load(&s_maintenance));
+}
+
 int main(void)
 {
     navigation_keeps_fetch_running();
@@ -590,6 +616,7 @@ int main(void)
     completion_waits_for_final_mailbox();
     preference_save_failure_is_visible();
     invalid_clock_does_not_start_fetch();
+    backup_can_start_while_waiting_for_input();
     puts("badge app background sync, setup deferral, preference and screen-off runtime tests passed");
     return 0;
 }

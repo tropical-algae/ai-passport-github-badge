@@ -273,6 +273,11 @@ static void app_task(void *context) {
     int64_t battery_at = 0, tick_at = 0;
     bool last_syncing = false, last_setup_saved = false;
     for (;;) {
+        /* Never hold the maintenance gate while waiting for input. The HTTP
+         * task has the same priority: releasing and immediately retaking this
+         * mutex can otherwise starve backup_begin() until its timeout. */
+        key_event_t event;
+        bool have_key = xQueueReceive(s_keys, &event, pdMS_TO_TICKS(20)) == pdTRUE;
         xSemaphoreTake(s_control_lock, portMAX_DELAY);
         if (atomic_load(&s_maintenance)) {
             xQueueReset(s_keys);
@@ -282,8 +287,7 @@ static void app_task(void *context) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        key_event_t event;
-        if (xQueueReceive(s_keys, &event, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (have_key) {
             do {
                 if (atomic_exchange(&s_key_overflow, false)) {
                     badge_input_init(&input);
