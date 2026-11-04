@@ -57,6 +57,10 @@ run_static_checks() {
         -o "${test_dir}/test_bsp_lvgl_init"
     "${test_dir}/test_bsp_lvgl_init"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+        -Itests/display_stubs -Itests/bsp_stubs -Icomponents/bsp/include \
+        tests/test_bsp_display_power.c -o "${test_dir}/test_bsp_display_power"
+    "${test_dir}/test_bsp_display_power"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
         -Itests/audio_stubs -Icomponents/bsp/include -Icomponents/bsp/src \
         tests/test_bsp_audio_recovery.c components/bsp/src/bsp_es8311_sleep_check.c \
         -o "${test_dir}/test_bsp_audio_recovery"

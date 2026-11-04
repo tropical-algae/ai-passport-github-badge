@@ -46,6 +46,32 @@ static int64_t s_retry_not_before;
 static bool s_config_ack_pending, s_config_ack_saved;
 static bool s_provision_pending, s_provision_waiting, s_manual_pending;
 static badge_idle_t s_idle;
+/* idle.asleep is the requested state. Hardware completion is tracked separately
+ * so a failed/partial transition cannot admit keys to an invisible screen. */
+static bool s_screen_blocked, s_screen_asleep;
+static int64_t s_screen_retry_at;
+
+static void service_screen(int64_t now) {
+    bool sleep = s_idle.asleep;
+    if ((sleep && s_screen_asleep) || (!sleep && !s_screen_blocked)) return;
+    s_screen_blocked = true;
+    if (now < s_screen_retry_at) return;
+    s_screen_retry_at = now + 1000000;
+    if (!bsp_lvgl_lock(100)) {
+        ESP_LOGW(TAG, "Screen %s waiting for LVGL lock", sleep ? "sleep" : "wake");
+        return;
+    }
+    s_screen_asleep = false; // A failed wake may already have issued SLPOUT.
+    esp_err_t e = sleep ? bsp_lvgl_sleep() : bsp_lvgl_wake(s_config.brightness);
+    bsp_lvgl_unlock();
+    if (e == ESP_OK) {
+        s_screen_asleep = sleep;
+        s_screen_blocked = sleep;
+        s_screen_retry_at = 0;
+    } else {
+        ESP_LOGW(TAG, "Screen %s failed: %s; retrying", sleep ? "sleep" : "wake", esp_err_to_name(e));
+    }
+}
 
 static void notify(const char *message, bool error) {
     if (bsp_lvgl_lock(1000)) {
@@ -230,7 +256,7 @@ static void save_preferences(void) {
         notify("APPLIED / NOT SAVED\nCHECK DEVICE STORAGE", true);
 }
 static void perform_action(badge_input_action_t key) {
-    if (!key.ready || !bsp_lvgl_lock(1000)) return;
+    if (!key.ready || s_idle.asleep || s_screen_blocked || !bsp_lvgl_lock(1000)) return;
     badge_action_t action = badge_ui_key((badge_key_t)key.key, key.long_press);
     bsp_lvgl_unlock();
     switch (action.kind) {
@@ -299,7 +325,15 @@ static void app_task(void *context) {
                                                    event.event == BSP_BTN_PRESS, event.at);
                     if (was_asleep && !s_idle.asleep) {
                         badge_input_init(&input);
-                        bsp_display_backlight(s_config.brightness);
+                        s_screen_retry_at = 0; // First wake attempt is immediate.
+                    }
+                    if (s_screen_blocked) {
+                        badge_input_init(&input);
+                        /* A wake failure may span further presses. Consume all
+                         * of those gestures, including a key still held when
+                         * the eventual hardware retry succeeds. */
+                        s_idle.consume_wake = s_idle.held_keys != 0;
+                        consumed = true;
                     }
                     if (!consumed) perform_action(badge_input_edge(&input, event.key,
                                                    event.event == BSP_BTN_PRESS, event.at));
@@ -411,8 +445,8 @@ static void app_task(void *context) {
             start_sync(true);
         }
         int64_t monotonic = esp_timer_get_time();
-        if (badge_idle_tick(&s_idle, s_config.screen_timeout_min, monotonic))
-            bsp_display_backlight(0);
+        badge_idle_tick(&s_idle, s_config.screen_timeout_min, monotonic);
+        service_screen(monotonic);
         if (monotonic >= battery_at) {
             s_status.battery_percent = bsp_battery_soc();
             battery_at = monotonic + 30000000;

@@ -70,7 +70,7 @@ In PR/ISSUES and STARS/GISTS, move focus with UP/DOWN and select the tab with OK
 | CONNECT WI-FI | Open phone setup; wait for an active sync to finish first |
 | REFETCH DATA | Start a background refresh and show success, partial completion or the failure reason |
 
-Confirming brightness, timeout or theme returns to the corresponding settings row. Screen timeout turns off the backlight; networking and scheduled refresh continue. Leaving settings or switching pages does not cancel a refresh.
+Confirming brightness, timeout or theme returns to the corresponding settings row. Screen timeout stops the backlight output, puts the LCD into sleep and pauses display rendering; networking and scheduled refresh continue. Waking restores the panel and redraws it before enabling the saved brightness. Leaving settings or switching pages does not cancel a refresh.
 
 The setup page provides separate **EXPORT BACKUP** and **RESTORE BACKUP** buttons. Export includes saved Wi-Fi, username, sync interval, timezone, appearance, timeout, latest data, avatar and accumulated activity for the current account. Unsaved form edits are not exported. A successful restore replaces saved settings and data, then restarts the badge; it does not require pressing the ordinary Save button.
 

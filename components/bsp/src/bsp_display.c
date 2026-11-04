@@ -231,13 +231,43 @@ esp_lcd_panel_handle_t bsp_display_panel(void) { return s_panel; }
 
 esp_lcd_panel_io_handle_t bsp_display_io(void) { return s_io; }
 
-void bsp_display_backlight(uint8_t percent) {
-    if (!s_bl_ready) return;
+esp_err_t bsp_display_set_backlight(uint8_t percent) {
+    if (!s_bl_ready) return ESP_ERR_INVALID_STATE;
     if (percent > 100) percent = 100;
+    if (!percent) return ledc_stop(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL, 0);
     uint32_t max_duty = (1u << BSP_BL_LEDC_RES) - 1u;
     uint32_t duty = (max_duty * percent) / 100u;
-    ledc_set_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL, duty);
-    ledc_update_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL);
+    esp_err_t e = ledc_set_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL, duty);
+    // IDF's update_duty re-enables sig_out_en after ledc_stop.
+    if (e == ESP_OK) e = ledc_update_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL);
+    return e;
+}
+
+void bsp_display_backlight(uint8_t percent) {
+    esp_err_t e = bsp_display_set_backlight(percent);
+    if (e != ESP_OK) ESP_LOGE(TAG, "Backlight update failed: %s", esp_err_to_name(e));
+}
+
+esp_err_t bsp_display_sleep(bool sleep) {
+    if (!s_ready || !s_panel) return ESP_ERR_INVALID_STATE;
+    esp_err_t e = bsp_display_set_backlight(0);
+    if (e != ESP_OK) return e;
+    if (sleep) {
+        e = esp_lcd_panel_disp_on_off(s_panel, false);
+        // Attempt Sleep In even if DISPOFF failed, but preserve the first error.
+        esp_err_t slept = esp_lcd_panel_disp_sleep(s_panel, true);
+        return e == ESP_OK ? slept : e;
+    }
+    e = esp_lcd_panel_disp_sleep(s_panel, false);
+    if (e == ESP_OK) {
+        // ST7789P3 v1.0 section 9.1.12 requires 120 ms from SLPOUT to a
+        // subsequent SLPIN. IDF 5.5.3 already waits 100 ms; finish that guard
+        // here so a caller can immediately request sleep again after return.
+        // Extra ticks cover delay conversion and initial tick-boundary rounding.
+        vTaskDelay(pdMS_TO_TICKS(20) + 2);
+        e = esp_lcd_panel_disp_on_off(s_panel, true);
+    }
+    return e;
 }
 
 esp_err_t bsp_display_prepare_deep_sleep(void) {

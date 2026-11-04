@@ -42,6 +42,8 @@ static unsigned test_avatar_decodes;
 static bool test_avatar_failure;
 static bool test_fail_next_lvgl_lock, test_finish_on_status, test_save_failure;
 static bool test_backup_on_wait, test_backup_admitted;
+static unsigned test_screen_sleeps, test_screen_wakes;
+static bool test_fail_screen_sleep, test_fail_screen_wake;
 static void finish_worker(void);
 static jmp_buf test_app_return, test_worker_return;
 static void (*test_step_hook)(unsigned completed_steps);
@@ -166,6 +168,21 @@ void bsp_display_backlight(uint8_t percent)
     test_backlight = percent;
     ++test_backlight_writes;
 }
+esp_err_t bsp_lvgl_sleep(void)
+{
+    assert(test_lvgl_held);
+    ++test_screen_sleeps;
+    bsp_display_backlight(0); // A failed transition can already be dark.
+    return test_fail_screen_sleep ? ESP_FAIL : ESP_OK;
+}
+esp_err_t bsp_lvgl_wake(uint8_t brightness)
+{
+    assert(test_lvgl_held);
+    ++test_screen_wakes;
+    if (test_fail_screen_wake) return ESP_FAIL;
+    bsp_display_backlight(brightness);
+    return ESP_OK;
+}
 esp_err_t bsp_battery_init(void) { return ESP_OK; }
 int bsp_battery_soc(void) { return 73; }
 
@@ -266,6 +283,10 @@ static void reset_fixture(void)
     test_avatar_path[0] = 0; test_avatar_decodes = 0; test_avatar_failure = false;
     test_fail_next_lvgl_lock = test_finish_on_status = test_save_failure = false;
     test_backup_on_wait = test_backup_admitted = false;
+    test_screen_sleeps = test_screen_wakes = 0;
+    test_fail_screen_sleep = test_fail_screen_wake = false;
+    s_screen_blocked = s_screen_asleep = false;
+    s_screen_retry_at = 0;
     memset(test_queues, 0, sizeof(test_queues));
     memset(test_sems, 0, sizeof(test_sems));
     memset(&test_worker, 0, sizeof(test_worker));
@@ -283,6 +304,7 @@ static void reset_fixture(void)
     test_step_hook = NULL;
     test_notification[0] = 0;
     test_monotonic = 1000000;
+    badge_idle_init(&s_idle, test_monotonic);
     test_epoch = 1800000000;
     badge_config_defaults(&s_config);
     snprintf(s_config.username, sizeof(s_config.username), "octocat");
@@ -507,6 +529,81 @@ static void screen_off_preserves_fetch_and_consumes_wake(void)
     choose_setting(4);
     run_app(6, idle_hook);
     assert(test_backlight_writes == 2 && !test_cancel_calls);
+    assert(test_screen_sleeps == 1 && test_screen_wakes == 1 && !s_screen_blocked);
+}
+
+static void screen_power_retries_partial_failures(void)
+{
+    reset_fixture();
+    choose_setting(4); // A running worker must survive all display retries.
+    s_idle.asleep = true;
+    test_fail_screen_sleep = true;
+    service_screen(test_monotonic);
+    assert(s_screen_blocked && !s_screen_asleep && test_screen_sleeps == 1);
+    press(BADGE_KEY_OK, true);
+    assert(test_ui.settings == BADGE_SETTINGS_MAIN);
+    service_screen(test_monotonic + 999999);
+    assert(test_screen_sleeps == 1);
+    test_monotonic += 1000000;
+    test_fail_screen_sleep = false;
+    service_screen(test_monotonic);
+    assert(s_screen_asleep && test_screen_sleeps == 2);
+    service_screen(test_monotonic + 1000000);
+    assert(test_screen_sleeps == 2); // Stable sleep needs no repeated commands.
+    s_idle.asleep = false;
+    test_fail_next_lvgl_lock = true;
+    service_screen(test_monotonic);
+    assert(s_screen_blocked && !test_screen_wakes);
+    test_monotonic += 1000000;
+    test_fail_screen_wake = true;
+    service_screen(test_monotonic);
+    assert(s_screen_blocked && !s_screen_asleep && test_screen_wakes == 1);
+    service_screen(test_monotonic + 999999);
+    assert(test_screen_wakes == 1);
+    // If a failed partial wake times out again, it must re-issue sleep.
+    s_idle.asleep = true;
+    test_monotonic += 60000000;
+    service_screen(test_monotonic);
+    assert(s_screen_asleep && test_screen_sleeps == 3);
+    s_idle.asleep = false; test_fail_screen_wake = false;
+    service_screen(test_monotonic);
+    assert(!s_screen_asleep && !s_screen_blocked && test_screen_wakes == 2);
+    assert(test_worker.alive && atomic_load(&s_syncing) && !test_cancel_calls);
+}
+
+static void failed_wake_hook(unsigned step)
+{
+    assert(test_ui.settings == BADGE_SETTINGS_MAIN);
+    assert(test_worker.alive && atomic_load(&s_syncing) && !test_cancel_calls);
+    if (step == 1) {
+        test_monotonic += 60000000;
+    } else if (step == 2) {
+        assert(s_screen_asleep && test_screen_sleeps == 1);
+        test_fail_screen_wake = true;
+        on_key(BSP_BTN_OK, BSP_BTN_PRESS, NULL);
+    } else if (step == 3) {
+        assert(s_screen_blocked && test_screen_wakes == 1);
+        on_key(BSP_BTN_OK, BSP_BTN_RELEASE, NULL);
+        on_key(BSP_BTN_OK, BSP_BTN_PRESS, NULL);
+        test_monotonic += BADGE_HOLD_US + 1;
+    } else if (step == 4) {
+        assert(s_screen_blocked && test_screen_wakes == 1); // Retry is throttled.
+        test_fail_screen_wake = false;
+        test_monotonic += 1000000;
+    } else if (step == 5) {
+        assert(!s_screen_blocked && test_screen_wakes == 2 && s_idle.consume_wake);
+        on_key(BSP_BTN_OK, BSP_BTN_RELEASE, NULL);
+    } else if (step == 6) {
+        assert(!s_idle.consume_wake && !s_screen_blocked);
+    }
+}
+static void failed_wake_consumes_further_gestures(void)
+{
+    reset_fixture(); s_config.screen_timeout_min = 1;
+    choose_setting(4);
+    run_app(6, failed_wake_hook);
+    press(BADGE_KEY_OK, true); // Only a fresh gesture after wake may navigate.
+    assert(test_ui.settings == BADGE_SETTINGS_CLOSED);
 }
 
 static void avatar_retries_after_worker_releases_memory(void)
@@ -612,6 +709,8 @@ int main(void)
     config_update_keeps_local_preferences();
     fetch_waits_for_queued_ap_commands();
     screen_off_preserves_fetch_and_consumes_wake();
+    screen_power_retries_partial_failures();
+    failed_wake_consumes_further_gestures();
     avatar_retries_after_worker_releases_memory();
     completion_waits_for_final_mailbox();
     preference_save_failure_is_visible();

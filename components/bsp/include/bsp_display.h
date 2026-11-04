@@ -21,8 +21,17 @@ esp_lcd_panel_handle_t bsp_display_panel(void);
 // 取底层 panel io 句柄(LVGL 接入需要)。未初始化返回 NULL。
 esp_lcd_panel_io_handle_t bsp_display_io(void);
 
-// 背光亮度 0..100(%)。LEDC PWM,0=全灭。
+// 背光亮度 0..100(%)。0 stops PWM with a low output; nonzero resumes PWM.
+// Serialize access from one task (or hold the LVGL lock). The checked form
+// reports hardware errors; the compatibility wrapper logs them.
+esp_err_t bsp_display_set_backlight(uint8_t percent);
 void bsp_display_backlight(uint8_t percent);
+
+// Reversible LCD sleep, leaving the backlight off in either direction.
+// Task context only; caller must prevent rendering (LVGL lock + paused refresh).
+// Blocks for ~100 ms on sleep and ~120 ms on wake. Retry after errors:
+// partial command success is possible. No GPIO hold or bus teardown is used.
+esp_err_t bsp_display_sleep(bool sleep);
 
 // deep sleep 专用：关闭显示、让 ST7789 进入 Sleep In，停止背光 PWM，
 // 将 CS/SCLK/MOSI/DC/背光设为安全电平并在 deep sleep 中保持。调用时必须
@@ -46,3 +55,16 @@ struct _lv_display_t *bsp_lvgl_init(void);
 // LVGL 尚未就绪或超时时 lock 返回 false；只有 lock 成功后才调用 unlock。
 bool bsp_lvgl_lock(int timeout_ms);
 void bsp_lvgl_unlock(void);
+
+// Reversible display power transitions after successful bsp_lvgl_init().
+// Caller MUST hold bsp_lvgl_lock() throughout; task context only, never a button
+// callback/ISR. Sleep pauses this display's refresh timer/invalidation, stops
+// PWM/LCD scanning, and permanently replaces the periodic LVGL tick with a
+// continuous monotonic callback. Other LVGL timers keep running normally.
+// Wake restores LCD/refresh/invalidation and a full frame, drains SPI DMA, then
+// restores brightness. The BSP fixes RGB565 portrait rendering, no SW rotation.
+// Each can block for ~120 ms plus rendering/SPI completion. Repeated success is
+// harmless; on error keep UI input blocked and retry at a bounded rate. Internal
+// state preserves partial transitions; neither API deinitializes the LVGL port.
+esp_err_t bsp_lvgl_sleep(void);
+esp_err_t bsp_lvgl_wake(uint8_t brightness);

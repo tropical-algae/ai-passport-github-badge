@@ -58,6 +58,8 @@ esp_err_t bsp_display_init(void);
 void *bsp_lvgl_init(void);
 bool bsp_lvgl_lock(int timeout);
 void bsp_lvgl_unlock(void);
+esp_err_t bsp_lvgl_sleep(void);
+esp_err_t bsp_lvgl_wake(uint8_t brightness);
 void bsp_display_backlight(uint8_t percent);
 esp_err_t bsp_battery_init(void);
 int bsp_battery_soc(void);
