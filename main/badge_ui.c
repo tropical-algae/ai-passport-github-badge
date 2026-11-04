@@ -375,12 +375,14 @@ static void activity(lv_layer_t *l)
         else if (day->coverage==BADGE_UNKNOWN) {
             frame(l,x,y,7,8,1,t->line); rect(l,x+3,y+3,1,2,t->muted);
         } else {
+            /* Keep the reference's solid heat cells. Partial coverage uses a
+             * dimmer fill instead of a pale underline that looks like damage. */
+            if (day->coverage==BADGE_PARTIAL) color=mixed(color,t->background,60);
             rect(l,x,y,7,8,color);
-            if (day->coverage==BADGE_PARTIAL) rect(l,x,y+7,7,1,t->muted);
         }
         if (i>=84 && day->day<=today) weeks[(i-84)/7]+=day->pushes;
     }
-    TXT(l,9,205,125,". UNKNOWN  _ PARTIAL",&badge_font_8,t->muted);
+    TXT(l,9,205,125,". UNKNOWN  DIM PARTIAL",&badge_font_8,t->muted);
     RIGHT(l,160,205,71,"NOW",&badge_font_8,t->muted);
     section(l,221,"RECENT 12 WEEKS / PUSH EVT");
     uint32_t maximum=1;

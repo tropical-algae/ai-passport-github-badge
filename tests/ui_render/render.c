@@ -77,6 +77,39 @@ static uint32_t area_hash(int x,int y,int width,int height) {
         hash=(hash^framebuffer[row*240+col])*16777619u;
     return hash;
 }
+static void assert_activity_cells_solid(void) {
+    unsigned partial=0,known=0;
+    int32_t today=(int32_t)(status.now/86400);
+    for(unsigned i=0;i<BADGE_DAYS;++i) {
+        const badge_day_t *day=&data.days[i];
+        if(!day->day || day->day>today || day->coverage==BADGE_UNKNOWN)continue;
+        int x=9+(int)(i/7)*9,y=132+(int)(i%7)*10;
+        uint16_t fill=framebuffer[y*240+x];
+        /* All eight rows must be one color, including the former white-line
+         * row. Keep the original two-pixel gutters outside each cell. */
+        for(int dy=0;dy<8;++dy)for(int dx=0;dx<7;++dx)
+            assert(framebuffer[(y+dy)*240+x+dx]==fill);
+        for(int dy=0;dy<8;++dy)for(int dx=7;dx<9;++dx)
+            assert(framebuffer[(y+dy)*240+x+dx]==lv_color_to_u16(lv_color_hex(0x080f0b)));
+        if(day->coverage==BADGE_PARTIAL) {
+            ++partial;
+            /* Coverage must remain distinguishable from a known day with
+             * the same activity count, without adding an edge decoration. */
+            bool compared=false;
+            for(unsigned j=0;j<BADGE_DAYS;++j) {
+                const badge_day_t *other=&data.days[j];
+                if(other->day && other->day<=today && other->coverage==BADGE_KNOWN && other->pushes==day->pushes) {
+                    int ox=9+(int)(j/7)*9,oy=132+(int)(j%7)*10;
+                    assert(framebuffer[oy*240+ox]!=fill);
+                    compared=true;break;
+                }
+            }
+            assert(compared);
+        } else ++known;
+    }
+    assert(partial && known);
+    puts("activity cells are solid; partial coverage stays distinct");
+}
 static uint32_t ring_hash(void) {
     uint32_t hash=2166136261u;
     for(int y=185;y<=269;y++)for(int x=8;x<=92;x++) {
@@ -227,7 +260,11 @@ int main(int argc,char **argv) {
         puts("native avatar checks passed");
         return 0;
     }
-    for(unsigned i=0;i<7;i++) {char name[32];snprintf(name,sizeof(name),"page-%u",i);save(name);badge_ui_key(BADGE_KEY_DOWN,true);}
+    for(unsigned i=0;i<7;i++) {
+        char name[32];snprintf(name,sizeof(name),"page-%u",i);save(name);
+        if(i==3)assert_activity_cells_solid();
+        badge_ui_key(BADGE_KEY_DOWN,true);
+    }
     for(unsigned i=0;i<4;i++)badge_ui_key(BADGE_KEY_DOWN,true);
     badge_ui_key(BADGE_KEY_DOWN,false);badge_ui_key(BADGE_KEY_OK,false);save("issues");
     badge_ui_key(BADGE_KEY_DOWN,true);badge_ui_key(BADGE_KEY_DOWN,false);badge_ui_key(BADGE_KEY_OK,false);save("gists");
