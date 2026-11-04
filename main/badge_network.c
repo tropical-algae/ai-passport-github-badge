@@ -717,12 +717,35 @@ static void got_ip(void)
     ESP_LOGI(TAG, "Station obtained IP");
 }
 
+static TickType_t worker_wait_ticks(void)
+{
+    lock();
+    bool scanning = s_scanning || s_scan_requested;
+    bool responsive = s_status.provisioning || s_provision_commands || scanning ||
+                      s_pending || s_submit_queued || s_save_await || s_backup_active || s_reboot_deadline;
+    unlock();
+    int64_t wait_ms = responsive ? 100 : 1000;
+    int64_t now = milliseconds();
+    /* These deadlines are owned by this worker. A scan postpones reconnects,
+     * so an already-due retry must not turn that scan into a busy loop. */
+    int64_t deadlines[] = {scanning ? 0 : s_next_connect, s_connect_deadline};
+    for (size_t i = 0; i < sizeof(deadlines) / sizeof(deadlines[0]); ++i) {
+        if (!deadlines[i]) continue;
+        if (deadlines[i] <= now) return 0;
+        int64_t remaining = deadlines[i] - now;
+        if (remaining < wait_ms) wait_ms = remaining;
+    }
+    TickType_t ticks = pdMS_TO_TICKS(wait_ms);
+    return ticks ? ticks : 1;
+}
+
 static void worker(void *context)
 {
     (void) context;
     command_t command;
     for (;;) {
-        if (xQueueReceive(s_commands, &command, pdMS_TO_TICKS(100)) == pdTRUE) {
+        /* A queued command/event interrupts this idle wait immediately. */
+        if (xQueueReceive(s_commands, &command, worker_wait_ticks()) == pdTRUE) {
             switch (command.kind) {
             case CMD_START:
                 if (start_provisioning() != ESP_OK) message("Unable to start setup Wi-Fi; try again");

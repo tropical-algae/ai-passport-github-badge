@@ -31,6 +31,10 @@ CONFIG_LV_CACHE_DEF_SIZE=16384
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
+# IDF 5.5.3 startup DFS uses the default CPU maximum and the XTAL minimum.
+# Its automatic configuration leaves light sleep disabled.
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
 # First-boot QR creation probes TJPGD even for an I1 canvas. Its info callback
 # has a 4272-byte frame in the ESP32-C3 build; the default main stack overflows.
 # This startup-only stack is freed when app_main returns (IDF adds 512 bytes).

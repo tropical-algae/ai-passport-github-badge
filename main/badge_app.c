@@ -303,7 +303,9 @@ static void app_task(void *context) {
          * task has the same priority: releasing and immediately retaking this
          * mutex can otherwise starve backup_begin() until its timeout. */
         key_event_t event;
-        bool have_key = xQueueReceive(s_keys, &event, pdMS_TO_TICKS(20)) == pdTRUE;
+        // A key wakes the queue immediately; hidden UI needs fewer idle polls.
+        TickType_t key_wait = pdMS_TO_TICKS(s_idle.asleep ? 250 : 20);
+        bool have_key = xQueueReceive(s_keys, &event, key_wait) == pdTRUE;
         xSemaphoreTake(s_control_lock, portMAX_DELAY);
         if (atomic_load(&s_maintenance)) {
             xQueueReset(s_keys);

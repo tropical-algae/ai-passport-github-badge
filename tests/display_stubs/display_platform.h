@@ -26,6 +26,7 @@ esp_err_t spi_bus_free(int);
 #define LEDC_CHANNEL_0 0
 #define LEDC_TIMER_10_BIT 10
 #define LEDC_AUTO_CLK 0
+#define LEDC_USE_XTAL_CLK 1
 typedef struct { int speed_mode, timer_num, duty_resolution, freq_hz, clk_cfg; } ledc_timer_config_t;
 typedef struct { int gpio_num, speed_mode, channel, timer_sel; uint32_t duty; int hpoint; } ledc_channel_config_t;
 esp_err_t ledc_timer_config(const ledc_timer_config_t *);

@@ -36,6 +36,37 @@ The main settings list is BRIGHTNESS, AUTO SCREEN OFF, COLOR THEME, CONNECT WI-F
 
 Inactivity is measured from the last button activity. Screen timeout stops the backlight PWM at a low level, sends LCD display-off and Sleep In, and pauses display refresh without stopping networking or sync. Any key wakes the LCD, redraws the full frame and waits for the display transfer before restoring the saved brightness; the entire wake gesture is consumed. Failed display transitions retain a blocked input state and retry at a bounded rate instead of reporting success or operating an invisible page. The reversible screen path keeps SPI, GPIO ownership and the application alive; it does not call the terminal deep-sleep helper. Preferences persist once an account is configured. Battery and local-clock indicators use placeholders when their values are unknown. The bundled 10 px fallback covers the documented CJK and punctuation inventory; unsupported characters, including emoji, use visible missing-glyph boxes.
 
+## Display power and idle work
+
+The default configuration enables ESP-IDF dynamic frequency scaling: the CPU
+can fall to the 40 MHz crystal frequency while idle and run at 160 MHz for work.
+The backlight uses the crystal clock so PWM stays stable as APB frequency changes.
+See the official [power-management guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32c3/api-reference/system/power_management.html)
+and [LEDC clock and stop APIs](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32c3/api-reference/peripherals/ledc.html).
+The isolated validation/release builds use these defaults; an existing local
+sdkconfig must also enable `CONFIG_PM_ENABLE` and `CONFIG_PM_DFS_INIT_AUTO`.
+
+After the first screen sleep, a continuous monotonic-clock callback replaces
+LVGL's 5 ms periodic tick. Only display refresh is paused; other LVGL timers
+retain real time. Disabling the whole timer handler is avoided because LVGL 9.5
+then returns a 1 ms wait to the port, causing frequent polling. Layout requests
+cannot resume a sleeping display, and rejected SPI submissions release LVGL's
+flush wait so a wake can report the error and retry.
+
+The application waits up to 250 ms between idle checks while asleep; a key
+interrupts that wait immediately. Ordinary network idle waits are up to one
+second, shortened for connection deadlines. Setup, scans and backup operations
+retain 100 ms checks, and queued network events wake the worker immediately.
+No input wait holds the backup maintenance lock.
+
+Screen-off keeps Wi-Fi, button detection and scheduled synchronization active;
+it does not enter CPU light or deep sleep. Wi-Fi uses IDF's default minimum
+modem-sleep mode, and an open setup hotspot still costs power. The badge does
+not start the I2S/audio driver. These facts do not establish board current or
+battery life: compare the same Wi-Fi, hotspot and brightness conditions before
+and after the update, including current measurements where available. Residual
+LCD visibility and sleep/wake behavior require device acceptance.
+
 ## Wi-Fi setup and account changes
 
 An unconfigured badge opens a temporary WPA2 hotspot with generated credentials, shown in a Wi-Fi QR. Join from a phone and open `http://192.168.4.1` if the captive helper does not open it. The portal scans nearby 2.4 GHz networks, deduplicates SSIDs and displays up to 16 by signal strength. Rescan and manual entry support hidden networks.

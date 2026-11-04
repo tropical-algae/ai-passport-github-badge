@@ -33,6 +33,8 @@
 #define BSP_BL_LEDC_CHANNEL  LEDC_CHANNEL_0
 #define BSP_BL_LEDC_RES      LEDC_TIMER_10_BIT
 #define BSP_BL_LEDC_FREQ_HZ  5000
+// Keep PWM independent of APB frequency changes during CPU power management.
+#define BSP_BL_LEDC_CLK      LEDC_USE_XTAL_CLK
 
 // ============================================================================
 // 按键:三键共用一个 ADC 引脚,靠分压电阻区分
