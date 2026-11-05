@@ -41,12 +41,14 @@ The app image preserves the existing NVS settings and badge cache when the layou
 
 ### 2. Connect and configure
 
-1. On first boot, scan the badge's Wi-Fi QR to join its temporary hotspot. Stay connected if the phone reports that it has no internet.
+1. On first boot, scan the badge's Wi-Fi QR, or manually select the displayed hotspot name and enter its displayed password. Stay connected if the phone reports that it has no internet.
 2. Open [http://192.168.4.1](http://192.168.4.1). Select one of the scanned **2.4 GHz** networks, or enter a hidden SSID manually.
 3. Enter the Wi-Fi password, a public GitHub username and a sync interval. The default is **6 hours**; the accepted range is **1–168 hours**.
-4. Save. After Wi-Fi connects and the settings are stored, the badge closes its setup QR automatically. The hotspot remains briefly so the phone can receive confirmation; GitHub sync begins after it closes.
+4. Save. The hotspot stays open while the badge connects to Wi-Fi and stores the settings. After returning the success result to the phone, it closes the setup QR and hotspot. GitHub sync starts after setup has finished.
 
-To change these settings later, hold OK and choose **CONNECT WI-FI**. A failed connection keeps the previous saved configuration. Wi-Fi networks that require a browser login are not supported.
+To change these settings later, hold OK and choose **CONNECT WI-FI**. Closing the setup dialog stops its hotspot; an already submitted connection/save operation continues, with its result shown on the badge. Failed setup keeps the previous saved configuration. The setup dialog stays awake until closed. Wi-Fi networks that require a browser login are not supported.
+
+Each new hotspot session has a new password. If the phone reuses an old password without prompting, forget the saved badge network, select it again and enter the password currently on screen. Only one phone can join the setup hotspot at a time.
 
 ### 3. Use the three buttons
 

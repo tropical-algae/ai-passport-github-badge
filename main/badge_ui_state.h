@@ -15,6 +15,8 @@ typedef struct {
 } badge_ui_state_t;
 
 void badge_ui_state_clamp(badge_ui_state_t *state, const badge_data_t *data);
+/* Credentials are usable only after the requested hotspot session is ready. */
+bool badge_ui_provision_ready(const badge_status_t *status);
 badge_action_t badge_ui_state_key(badge_ui_state_t *state, badge_key_t key,
                                  bool long_press, const badge_data_t *data,
                                  const badge_config_t *config);

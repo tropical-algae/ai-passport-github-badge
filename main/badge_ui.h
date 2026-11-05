@@ -16,7 +16,8 @@ void badge_ui_update(const badge_data_t *data, const badge_config_t *config,
                      const badge_status_t *status);
 void badge_ui_tick(const badge_status_t *status);
 badge_action_t badge_ui_key(badge_key_t key, bool long_press);
-/* Config portal opened on first boot or by settings. */
+/* Start a fresh dialog on first boot or by settings, immediately clearing old
+ * credentials. The application then publishes the requested session's status. */
 void badge_ui_show_provision(void);
 /* Close only the Wi-Fi dialog; the application controls AP/server lifetime. */
 void badge_ui_close_provision(void);

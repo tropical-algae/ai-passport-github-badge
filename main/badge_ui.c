@@ -4,6 +4,7 @@
 #include "badge_sync_parse.h"
 #include "lvgl.h"
 #include "src/draw/lv_image_decoder_private.h"
+#include "src/libs/qrcode/qrcodegen.h"
 #include "src/misc/cache/instance/lv_image_cache.h"
 
 #include <ctype.h>
@@ -60,6 +61,18 @@ static uint32_t toast_until;
 static char toast_text[128];
 static const char *toast_detail;
 static bool toast_error;
+enum { WIFI_QR_BOX_SIDE=123, WIFI_QR_BOX_TOP=79,
+       PROFILE_QR_BOX_SIDE=140, PROFILE_QR_BOX_TOP=81, QR_QUIET_MODULES=4 };
+
+static int qr_box_side(void)
+{
+    return state.modal==BADGE_MODAL_PROFILE?PROFILE_QR_BOX_SIDE:WIFI_QR_BOX_SIDE;
+}
+
+static int qr_box_top(void)
+{
+    return state.modal==BADGE_MODAL_PROFILE?PROFILE_QR_BOX_TOP:WIFI_QR_BOX_TOP;
+}
 
 static const badge_theme_t *theme(void) { return &themes[config.theme < 5 ? config.theme : 0]; }
 static uint32_t mixed(uint32_t a, uint32_t b, unsigned percent)
@@ -609,7 +622,8 @@ static void status_line(lv_layer_t *l)
 static void modal(lv_layer_t *l)
 {
     const badge_theme_t *t=theme();
-    bool setup_waiting=state.modal==BADGE_MODAL_WIFI && !status.provisioning && status.syncing;
+    bool wifi_ready=badge_ui_provision_ready(&status);
+    bool setup_waiting=state.modal==BADGE_MODAL_WIFI && !wifi_ready && status.syncing;
     rect(l,0,27,240,266,t->background);
     rect(l,12,46,222,240,0x000000);
     rect(l,9,43,222,240,t->background); frame(l,9,43,222,240,2,t->accent);
@@ -619,12 +633,20 @@ static void modal(lv_layer_t *l)
         CENTER(l,19,230,202,account,&badge_font_10,t->accent);
         CENTER(l,19,249,202,"SCAN TO MEET ON GITHUB",&badge_font_8,t->muted);
     } else {
-        CENTER(l,19,78,202,status.provisioning&&status.ap_ssid[0]?status.ap_ssid:setup_waiting?"FETCH IN PROGRESS":"STARTING HOTSPOT...",&badge_font_8,t->accent);
-        CENTER(l,19,216,202,setup_waiting?"SYNC CONTINUES IN BACKGROUND":"01 SCAN TO JOIN WI-FI",&badge_font_8,t->muted);
-        CENTER(l,19,233,202,setup_waiting?"HOTSPOT OPENS WHEN FINISHED":"02 OPEN 192.168.4.1",&badge_font_8,t->accent);
-        CENTER(l,19,248,202,setup_waiting?"KEEP BROWSING OR WAIT HERE":"WI-FI / USERNAME / SYNC",&badge_font_8,t->muted);
+        if(wifi_ready) {
+            TXT(l,20,211,34,"SSID",&badge_font_8,t->muted);
+            TXT(l,59,211,162,status.ap_ssid,&badge_font_8,t->accent);
+            TXT(l,20,229,34,"PASS",&badge_font_8,t->muted);
+            TXT(l,59,228,162,status.ap_password,&badge_font_10,t->accent);
+        } else {
+            CENTER(l,19,211,202,setup_waiting?"FETCH IN PROGRESS":"STARTING HOTSPOT...",&badge_font_8,t->accent);
+        }
+        CENTER(l,19,245,202,"192.168.4.1",&badge_font_8,t->accent);
     }
-    if(!qr_valid)CENTER(l,28,151,184,state.modal==BADGE_MODAL_WIFI?(setup_waiting?"SETUP AFTER FETCH":"WAITING FOR HOTSPOT"):"QR UNAVAILABLE",&badge_font_8,t->muted);
+    if(qr_valid) {
+        int side=qr_box_side();
+        rect(l,(240-side)/2,qr_box_top(),side,side,0xffffff);
+    } else CENTER(l,28,151,184,state.modal==BADGE_MODAL_WIFI?(wifi_ready?"QR UNAVAILABLE":setup_waiting?"SETUP AFTER FETCH":"WAITING FOR HOTSPOT"):"QR UNAVAILABLE",&badge_font_8,t->muted);
     rect(l,19,263,202,12,t->accent);
     center_ascii(l,19,263,202,12,"[OK] CLOSE",&badge_font_8,t->background);
 }
@@ -657,21 +679,41 @@ static void update_qr(void)
 {
     if(state.modal==BADGE_MODAL_NONE) {
         if(qr)lv_obj_add_flag(qr,LV_OBJ_FLAG_HIDDEN);
-        qr_modal=BADGE_MODAL_NONE; return;
+        qr_modal=BADGE_MODAL_NONE;qr_valid=false;
+        memset(qr_content,0,sizeof(qr_content));return;
     }
     char content[192]={0};
     if(state.modal==BADGE_MODAL_PROFILE)snprintf(content,sizeof(content),"https://github.com/%s",config.username);
-    else if(status.provisioning&&status.ap_ssid[0])snprintf(content,sizeof(content),"WIFI:T:WPA;S:%s;P:%s;;",status.ap_ssid,status.ap_password);
+    else if(badge_ui_provision_ready(&status))snprintf(content,sizeof(content),"WIFI:T:WPA;S:%s;P:%s;;",status.ap_ssid,status.ap_password);
+    if(!content[0]) {
+        if(qr)lv_obj_add_flag(qr,LV_OBJ_FLAG_HIDDEN);
+        qr_valid=false;qr_modal=BADGE_MODAL_NONE;
+        memset(qr_content,0,sizeof(qr_content));return;
+    }
     if(!qr) {
         qr=lv_qrcode_create(screen);
         lv_qrcode_set_dark_color(qr,lv_color_black());lv_qrcode_set_light_color(qr,lv_color_white());
-        lv_qrcode_set_quiet_zone(qr,true);
+        /* LVGL 9.5's quiet-zone sizing can leave fewer than four modules.
+         * Use an exact integer module size and paint our own white surround. */
+        lv_qrcode_set_quiet_zone(qr,false);
     }
     if(qr_modal!=state.modal || strcmp(qr_content,content)) {
-        int side=state.modal==BADGE_MODAL_PROFILE?140:116;
-        lv_qrcode_set_size(qr,side);lv_obj_set_pos(qr,(240-side)/2,state.modal==BADGE_MODAL_PROFILE?81:94);
+        int box=qr_box_side();
+        int version=qrcodegen_getMinFitVersion(qrcodegen_Ecc_MEDIUM,strlen(content));
+        int modules=qrcodegen_version2size(version);
+        int scale=modules>0?box/(modules+2*QR_QUIET_MODULES):0;
+        int side=modules*scale, inset=(box-side)/2;
+        qr_valid=false;
+        if(scale>0) {
+            lv_qrcode_set_size(qr,side);
+            lv_obj_set_pos(qr,(240-box)/2+inset,qr_box_top()+inset);
+            const lv_draw_buf_t *buffer=lv_canvas_get_draw_buf(qr);
+            /* set_size is void and preserves the previous buffer on OOM. */
+            qr_valid=buffer && buffer->header.w==(uint32_t)side &&
+                     buffer->header.h==(uint32_t)side &&
+                     lv_qrcode_update(qr,content,strlen(content))==LV_RESULT_OK;
+        }
         snprintf(qr_content,sizeof(qr_content),"%s",content);qr_modal=state.modal;
-        qr_valid=content[0]&&lv_qrcode_update(qr,content,strlen(content))==LV_RESULT_OK;
     }
     if(qr_valid)lv_obj_remove_flag(qr,LV_OBJ_FLAG_HIDDEN);else lv_obj_add_flag(qr,LV_OBJ_FLAG_HIDDEN);
 }
@@ -692,9 +734,7 @@ void badge_ui_init(const badge_data_t *new_data, const badge_config_t *new_confi
 void badge_ui_update(const badge_data_t *new_data, const badge_config_t *new_config,
                      const badge_status_t *new_status)
 {
-    bool stopped_ap=status.provisioning&&!new_status->provisioning;
     data=new_data;config=*new_config;status=*new_status;
-    if(stopped_ap&&state.modal==BADGE_MODAL_WIFI)state.modal=BADGE_MODAL_NONE;
     badge_ui_state_clamp(&state,data);
     lv_obj_set_style_bg_color(screen,lv_color_hex(theme()->background),0);
     update_qr();lv_obj_invalidate(screen);
@@ -706,12 +746,14 @@ void badge_ui_tick(const badge_status_t *new_status)
                  status.connected!=new_status->connected || status.syncing!=new_status->syncing ||
                  status.provisioning!=new_status->provisioning || strcmp(status.message,new_status->message);
     bool ap_changed=status.provisioning!=new_status->provisioning ||
+                    status.provisioning_busy!=new_status->provisioning_busy ||
+                    status.provisioning_session!=new_status->provisioning_session ||
+                    status.provisioning_ready_session!=new_status->provisioning_ready_session ||
                     strcmp(status.ap_ssid,new_status->ap_ssid) || strcmp(status.ap_password,new_status->ap_password);
     /* Keep the visible countdown moving, including its transition to ready,
      * without redrawing idle pages on every application tick. */
     if(status.now!=new_status->now && new_status->connected && !new_status->syncing &&
        state.modal==BADGE_MODAL_NONE && (waiting_to_retry(status.now)||waiting_to_retry(new_status->now)))changed=true;
-    if(status.provisioning&&!new_status->provisioning&&state.modal==BADGE_MODAL_WIFI)state.modal=BADGE_MODAL_NONE;
     status=*new_status;
     if(ap_changed) {update_qr();changed=true;}
     if(toast_text[0]&&(int32_t)(toast_until-lv_tick_get())<=0) {toast_text[0]=0;changed=true;}
@@ -721,6 +763,9 @@ void badge_ui_tick(const badge_status_t *new_status)
 badge_action_t badge_ui_key(badge_key_t key, bool long_press)
 {
     badge_action_t action=badge_ui_state_key(&state,key,long_press,data,&config);
+    if(action.kind==BADGE_ACTION_PROVISION) {
+        badge_ui_show_provision();return action;
+    }
     if(!long_press && key==BADGE_KEY_OK && state.settings==BADGE_SETTINGS_CLOSED && state.page==2 && state.modal==BADGE_MODAL_NONE) {
         badge_ui_notify("USE UP / DOWN TO CHANGE",false);
     }
@@ -729,6 +774,14 @@ badge_action_t badge_ui_key(badge_key_t key, bool long_press)
 
 void badge_ui_show_provision(void)
 {
+    /* A new open request must never display the previous AP's credentials,
+     * even before the application has queued the next network session. */
+    status.provisioning=false;status.provisioning_busy=true;
+    memset(status.ap_ssid,0,sizeof(status.ap_ssid));
+    memset(status.ap_password,0,sizeof(status.ap_password));
+    qr_valid=false;qr_modal=BADGE_MODAL_NONE;
+    memset(qr_content,0,sizeof(qr_content));
+    if(qr)lv_obj_add_flag(qr,LV_OBJ_FLAG_HIDDEN);
     state.modal=BADGE_MODAL_WIFI;update_qr();lv_obj_invalidate(screen);
 }
 

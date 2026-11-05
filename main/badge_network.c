@@ -30,12 +30,13 @@ static const char *AP_ADDRESS = "192.168.4.1";
 extern const char portal_html_start[] asm("_binary_badge_portal_html_start");
 extern const char portal_html_end[] asm("_binary_badge_portal_html_end");
 
-typedef enum { CMD_START, CMD_STOP, CMD_APPLY, CMD_SUBMIT, CMD_COMMIT_RESULT, CMD_IP, CMD_LOST_IP,
+typedef enum { CMD_PROVISION, CMD_APPLY, CMD_SUBMIT, CMD_COMMIT_RESULT, CMD_IP, CMD_LOST_IP,
                CMD_DISCONNECTED, CMD_AP_CLIENT, CMD_AP_DHCP, CMD_SCAN, CMD_SCAN_DONE } command_kind_t;
 typedef struct {
     command_kind_t kind;
     badge_config_t config;
     int reason;
+    uint32_t session;
 } command_t;
 
 static SemaphoreHandle_t s_lock;
@@ -49,7 +50,12 @@ static badge_status_t s_status;
 static bool s_pending, s_submit_queued, s_saved, s_save_await, s_sntp_ready, s_initialized, s_submission_failed;
 static bool s_waiting_ip;
 static bool s_backup_active;
-static unsigned s_provision_commands; /* Protected by s_lock, includes executing commands. */
+/* Latest intent survives a full command queue. Session IDs prevent an old
+ * save/close result from affecting a newly opened setup dialog. */
+static bool s_provision_requested, s_provision_transition, s_services_active;
+static uint32_t s_submit_session, s_close_session, s_saved_result_id;
+static int64_t s_provision_retry, s_close_deadline; /* Protected by s_lock. */
+static bool s_provision_error_reported;
 static int64_t s_reboot_deadline;
 static bool s_scan_requested, s_scanning;
 static badge_portal_network_t s_networks[BADGE_PORTAL_NETWORK_MAX];
@@ -58,13 +64,27 @@ static char s_scan_message[96];
 static int64_t s_scan_deadline;
 static char s_nonce[33];
 static int s_dns = -1;
-static int64_t s_next_connect, s_pending_deadline, s_close_deadline, s_connect_deadline;
+static int64_t s_next_connect, s_pending_deadline, s_connect_deadline;
 static unsigned s_failures;
 static esp_event_handler_instance_t s_wifi_handler, s_ip_handler;
 
 static int64_t milliseconds(void) { return esp_timer_get_time() / 1000; }
 static void lock(void) { xSemaphoreTake(s_lock, portMAX_DELAY); }
 static void unlock(void) { xSemaphoreGive(s_lock); }
+
+static bool provisioning_busy_locked(void)
+{
+    return s_provision_transition || (s_provision_requested ?
+        !s_status.provisioning || s_status.provisioning_ready_session != s_status.provisioning_session :
+        s_status.provisioning || s_services_active || s_status.provisioning_ready_session != 0);
+}
+
+static void notice_locked(const char *text, bool error)
+{
+    if (++s_status.network_notice_id == 0) ++s_status.network_notice_id;
+    s_status.network_notice_error = error;
+    snprintf(s_status.network_notice, sizeof(s_status.network_notice), "%s", text);
+}
 
 static void message(const char *text)
 {
@@ -80,20 +100,12 @@ static void heap_log(const char *phase)
              (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
-static esp_err_t enqueue(command_kind_t kind, const badge_config_t *config)
+static esp_err_t enqueue(command_kind_t kind, const badge_config_t *config, uint32_t session)
 {
     if (!s_initialized || !s_commands) return ESP_ERR_INVALID_STATE;
-    command_t command = {.kind = kind};
+    command_t command = {.kind = kind, .session = session};
     if (config) command.config = *config;
-    bool provision = kind == CMD_START || kind == CMD_STOP;
-    /* Publish the transition before the worker can take the command. Keeping
-     * it pending through completion prevents TLS from racing an unstarted AP. */
-    if (provision) { lock(); ++s_provision_commands; }
     bool sent = xQueueSend(s_commands, &command, 0) == pdTRUE;
-    if (provision) {
-        if (!sent) --s_provision_commands;
-        unlock();
-    }
     return sent ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
@@ -128,7 +140,7 @@ static bool request_on_ap(httpd_req_t *request)
         !badge_portal_local_address_matches((const struct sockaddr *) &local, size,
                                            inet_addr(AP_ADDRESS))) return false;
     lock();
-    bool enabled = s_status.provisioning;
+    bool enabled = s_status.provisioning && s_provision_requested && !provisioning_busy_locked();
     unlock();
     return enabled;
 }
@@ -199,12 +211,14 @@ static esp_err_t portal_state(httpd_req_t *request)
     badge_config_t config;
     char nonce[33], status_text[64];
     bool pending, saved;
+    uint32_t saved_result_id;
     lock();
     config = s_config;
     snprintf(nonce, sizeof(nonce), "%s", s_nonce);
     snprintf(status_text, sizeof(status_text), "%s", s_status.message);
     pending = s_pending || s_submit_queued || s_save_await || s_backup_active || s_reboot_deadline;
-    saved = s_saved;
+    saved = s_saved && !pending && s_submit_session == s_status.provisioning_ready_session;
+    saved_result_id = saved ? s_saved_result_id : 0;
     unlock();
     cJSON *json = cJSON_CreateObject();
     if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
@@ -215,6 +229,7 @@ static esp_err_t portal_state(httpd_req_t *request)
     cJSON_AddStringToObject(json, "message", status_text);
     cJSON_AddBoolToObject(json, "pending", pending);
     cJSON_AddBoolToObject(json, "saved", saved);
+    cJSON_AddNumberToObject(json, "saved_result_id", saved_result_id);
     cJSON_AddBoolToObject(json, "open", config.ssid[0] && !config.password[0]);
     char *body = cJSON_PrintUnformatted(json);
     cJSON_Delete(json);
@@ -225,6 +240,37 @@ static esp_err_t portal_state(httpd_req_t *request)
     esp_err_t result = httpd_resp_send(request, body, HTTPD_RESP_USE_STRLEN);
     cJSON_free(body);
     return result;
+}
+
+static esp_err_t portal_ack(httpd_req_t *request)
+{
+    if (!request_from_ap(request)) return httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Use the setup Wi-Fi");
+    if (!request_nonce_valid(request)) return json_message(request, "403 Forbidden", "Setup session expired. Reload this page.");
+    if (request->content_len) return json_message(request, "400 Bad Request", "Acknowledgement must have no body.");
+    char result_text[11];
+    uint32_t result_id = 0;
+    if (httpd_req_get_hdr_value_str(request, "X-Setup-Result", result_text, sizeof(result_text)) != ESP_OK ||
+        result_text[0] < '1' || result_text[0] > '9')
+        return json_message(request, "400 Bad Request", "Invalid saved-result acknowledgement.");
+    for (size_t i = 0; result_text[i]; ++i) {
+        unsigned digit = (unsigned char)result_text[i] - '0';
+        if (digit > 9 || result_id > (UINT32_MAX - digit) / 10)
+            return json_message(request, "400 Bad Request", "Invalid saved-result acknowledgement.");
+        result_id = result_id * 10 + digit;
+    }
+    lock();
+    bool saved = s_saved && !s_submit_queued && !s_pending && !s_save_await && s_provision_requested &&
+        result_id == s_saved_result_id &&
+        s_submit_session == s_status.provisioning_session &&
+        s_submit_session == s_status.provisioning_ready_session;
+    if (saved) {
+        int64_t deadline = milliseconds() + 200;
+        if (!s_close_deadline || deadline < s_close_deadline) s_close_deadline = deadline;
+        s_close_session = s_submit_session;
+    }
+    unlock();
+    return json_message(request, saved ? "200 OK" : "409 Conflict",
+                        saved ? "Saved. Closing the setup hotspot." : "Settings are not saved yet.");
 }
 
 static esp_err_t portal_networks(httpd_req_t *request)
@@ -275,7 +321,7 @@ static esp_err_t portal_scan(httpd_req_t *request)
     }
     unlock();
     if (pending) return json_message(request, "409 Conflict", "Wait until Wi-Fi connection completes.");
-    if (!scanning && enqueue(CMD_SCAN, NULL) != ESP_OK) {
+    if (!scanning && enqueue(CMD_SCAN, NULL, 0) != ESP_OK) {
         lock(); s_scan_requested = false; unlock();
         return json_message(request, "503 Service Unavailable", "Device busy. Try again.");
     }
@@ -312,6 +358,7 @@ static esp_err_t portal_config(httpd_req_t *request)
     current = s_config;
     snprintf(nonce, sizeof(nonce), "%s", s_nonce);
     bool pending = s_pending || s_submit_queued || s_save_await || s_backup_active || s_reboot_deadline;
+    uint32_t session = s_status.provisioning_ready_session;
     unlock();
     if (pending) {
         memset(body, 0, sizeof(body));
@@ -324,8 +371,21 @@ static esp_err_t portal_config(httpd_req_t *request)
     if (!valid) return json_message(request, "400 Bad Request", error);
     /* Reserve the queued submission before replying: a second tab must not
      * start a restore while the worker has not yet processed this command. */
-    lock(); s_submit_queued = true; unlock();
-    esp_err_t result = enqueue(CMD_SUBMIT, &candidate);
+    lock();
+    bool current_session = s_provision_requested && !provisioning_busy_locked() && session &&
+        session == s_status.provisioning_ready_session && session == s_status.provisioning_session;
+    if (current_session) {
+        s_submit_queued = true;
+        s_saved = false;
+        s_saved_result_id = 0;
+        s_close_deadline = 0;
+    }
+    unlock();
+    if (!current_session) {
+        memset(&candidate, 0, sizeof(candidate));
+        return json_message(request, "409 Conflict", "Setup session closed. Reopen setup and retry.");
+    }
+    esp_err_t result = enqueue(CMD_SUBMIT, &candidate, session);
     memset(&candidate, 0, sizeof(candidate));
     if (result != ESP_OK) {
         lock(); s_submit_queued = false; unlock();
@@ -448,7 +508,7 @@ static esp_err_t start_http(void)
     config.stack_size = 6144;
     config.max_open_sockets = 3;
     config.backlog_conn = 2;
-    config.max_uri_handlers = 7;
+    config.max_uri_handlers = 8;
     config.recv_wait_timeout = 5;
     config.send_wait_timeout = 5;
     config.lru_purge_enable = true;
@@ -457,6 +517,7 @@ static esp_err_t start_http(void)
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = portal_page},
         {.uri = "/api/state", .method = HTTP_GET, .handler = portal_state},
+        {.uri = "/api/ack", .method = HTTP_POST, .handler = portal_ack},
         {.uri = "/api/config", .method = HTTP_POST, .handler = portal_config},
         {.uri = "/api/networks", .method = HTTP_GET, .handler = portal_networks},
         {.uri = "/api/scan", .method = HTTP_POST, .handler = portal_scan},
@@ -468,14 +529,14 @@ static esp_err_t start_http(void)
         if (result != ESP_OK) break;
     }
     if (result == ESP_OK) result = httpd_register_err_handler(s_http, HTTPD_404_NOT_FOUND, portal_not_found);
-    if (result != ESP_OK) { httpd_stop(s_http); s_http = NULL; }
+    if (result != ESP_OK && httpd_stop(s_http) == ESP_OK) s_http = NULL;
     return result;
 }
 
-static void start_dns(void)
+static esp_err_t start_dns(void)
 {
     s_dns = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s_dns < 0) return;
+    if (s_dns < 0) return ESP_FAIL;
     struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(53)};
     address.sin_addr.s_addr = inet_addr(AP_ADDRESS);
     int flags = fcntl(s_dns, F_GETFL, 0);
@@ -483,8 +544,10 @@ static void start_dns(void)
         fcntl(s_dns, F_SETFL, flags | O_NONBLOCK) != 0) {
         close(s_dns);
         s_dns = -1;
-        ESP_LOGW(TAG, "Captive DNS unavailable; manual portal URL remains available");
+        ESP_LOGW(TAG, "Captive DNS unavailable; setup startup will retry");
+        return ESP_FAIL;
     }
+    return ESP_OK;
 }
 
 static void poll_dns(void)
@@ -593,15 +656,12 @@ static esp_err_t connect_config(const badge_config_t *config)
     return result;
 }
 
-static esp_err_t start_provisioning(void)
+static esp_err_t start_provisioning(uint32_t session)
 {
-    lock();
-    bool active = s_status.provisioning;
-    unlock();
-    if (active) return ESP_OK;
     heap_log("before AP");
     uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    esp_err_t result = esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    if (result != ESP_OK) return result;
     char ssid[33], password[20], nonce[33];
     snprintf(ssid, sizeof(ssid), "GitHubBadge-%02X%02X%02X", mac[3], mac[4], mac[5]);
     uint8_t random[22];
@@ -618,13 +678,21 @@ static esp_err_t start_provisioning(void)
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ap.ap.max_connection = 1;
     ap.ap.pmf_cfg.capable = true;
-    esp_err_t result = esp_wifi_set_mode(WIFI_MODE_APSTA);
-    if (result == ESP_OK) result = esp_wifi_set_config(WIFI_IF_AP, &ap);
+    result = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (result == ESP_OK) {
+        lock(); s_status.provisioning = true; unlock();
+        result = esp_wifi_set_config(WIFI_IF_AP, &ap);
+    }
     memset(&ap, 0, sizeof(ap));
-    if (result != ESP_OK) { esp_wifi_set_mode(WIFI_MODE_STA); return result; }
+    if (result != ESP_OK) return result;
+    lock(); s_services_active = true; unlock();
+    result = start_dns();
+    if (result == ESP_OK) result = start_http();
+    if (result != ESP_OK) return result;
     lock();
-    s_status.provisioning = true;
+    s_status.provisioning_ready_session = session;
     s_saved = false;
+    s_saved_result_id = 0;
     s_network_count = 0;
     s_scan_message[0] = 0;
     s_submission_failed = false;
@@ -633,18 +701,6 @@ static esp_err_t start_provisioning(void)
     snprintf(s_nonce, sizeof(s_nonce), "%s", nonce);
     snprintf(s_status.message, sizeof(s_status.message), "Join setup Wi-Fi, open 192.168.4.1");
     unlock();
-    s_close_deadline = 0;
-    start_dns();
-    result = start_http();
-    if (result != ESP_OK) {
-        if (s_dns >= 0) { close(s_dns); s_dns = -1; }
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        lock();
-        s_status.provisioning = false;
-        memset(s_status.ap_password, 0, sizeof(s_status.ap_password));
-        unlock();
-        return result;
-    }
     heap_log("after AP and HTTP");
     return ESP_OK;
 }
@@ -655,6 +711,7 @@ static void cancel_pending(void)
     bool pending = s_pending;
     badge_config_t previous = s_config;
     s_pending = false;
+    if (pending) s_status.connected = false;
     memset(&s_pending_config, 0, sizeof(s_pending_config));
     unlock();
     s_pending_deadline = 0;
@@ -662,21 +719,67 @@ static void cancel_pending(void)
     memset(&previous, 0, sizeof(previous));
 }
 
-static void stop_provisioning(void)
+static esp_err_t stop_provisioning(void)
 {
+    /* Drop only the phone-facing AP. The accepted STA validation/save and
+     * any GitHub worker remain independent of the setup dialog. */
+    lock(); s_status.provisioning_ready_session = 0; unlock();
+    esp_err_t result = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (result != ESP_OK) return result;
+    lock(); s_status.provisioning = false; unlock();
     cancel_scan();
-    cancel_pending();
-    if (s_http) { httpd_stop(s_http); s_http = NULL; }
-    if (s_dns >= 0) { close(s_dns); s_dns = -1; }
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    s_close_deadline = 0;
+    /* Never hold s_lock while waiting for an HTTP handler. Closing the AP
+     * first lets a phone transfer fail, while its storage cleanup completes. */
+    if (s_http) {
+        result = httpd_stop(s_http);
+        if (result != ESP_OK) return result;
+        s_http = NULL;
+    }
+    if (s_dns >= 0) {
+        if (close(s_dns) != 0 && errno != EBADF) return ESP_FAIL;
+        s_dns = -1;
+    }
     lock();
-    s_status.provisioning = false;
+    s_services_active = false;
     memset(s_status.ap_password, 0, sizeof(s_status.ap_password));
+    memset(s_status.ap_ssid, 0, sizeof(s_status.ap_ssid));
     memset(s_nonce, 0, sizeof(s_nonce));
-    snprintf(s_status.message, sizeof(s_status.message), "%s", s_status.connected ? "Wi-Fi connected" : "Offline; displaying saved data");
+    if (!s_pending && !s_save_await)
+        snprintf(s_status.message, sizeof(s_status.message), "%s", s_status.connected ? "Wi-Fi connected" : "Offline; displaying saved data");
     unlock();
     heap_log("after AP stop");
+    return ESP_OK;
+}
+
+static void reconcile_provisioning(void)
+{
+    lock();
+    bool requested = s_provision_requested;
+    uint32_t session = s_status.provisioning_session;
+    bool busy = provisioning_busy_locked();
+    bool cleanup = s_status.provisioning || s_services_active || s_status.provisioning_ready_session;
+    if (!busy || milliseconds() < s_provision_retry) { unlock(); return; }
+    s_provision_transition = true;
+    unlock();
+    esp_err_t result = cleanup ? stop_provisioning() : ESP_OK;
+    lock();
+    bool still_requested = requested && s_provision_requested && session == s_status.provisioning_session;
+    unlock();
+    if (result == ESP_OK && still_requested) result = start_provisioning(session);
+    lock();
+    s_provision_transition = false;
+    if (result != ESP_OK) {
+        if (!s_provision_error_reported) {
+            notice_locked(requested ? "HOTSPOT START FAILED / RETRYING" : "HOTSPOT CLOSE FAILED / RETRYING", true);
+            s_provision_error_reported = true;
+        }
+        if (requested == s_provision_requested && session == s_status.provisioning_session)
+            s_provision_retry = milliseconds() + 1000;
+    } else {
+        s_provision_retry = 0;
+        s_provision_error_reported = false;
+    }
+    unlock();
 }
 
 static void got_ip(void)
@@ -687,18 +790,16 @@ static void got_ip(void)
     badge_config_t committed;
     lock();
     if (s_pending && !s_waiting_ip) { unlock(); return; }
-    const badge_config_t *expected = s_pending ? &s_pending_config : &s_config;
+    const badge_config_t *expected = (s_pending || s_save_await) ? &s_pending_config : &s_config;
     /* Drop IP events queued by a previous connection while changing networks. */
     if (strncmp((const char *) record.ssid, expected->ssid, sizeof(record.ssid))) { unlock(); return; }
     s_status.connected = true;
     bool commit = s_pending;
     if (commit) {
-        s_config = s_pending_config;
-        committed = s_config;
+        committed = s_pending_config;
         s_pending = false;
         s_saved = false;
         s_save_await = true;
-        memset(&s_pending_config, 0, sizeof(s_pending_config));
     }
     if (commit || !s_status.provisioning || !s_submission_failed)
         snprintf(s_status.message, sizeof(s_status.message), "%s", commit ? "Wi-Fi connected; saving settings" : "Wi-Fi connected");
@@ -721,14 +822,16 @@ static TickType_t worker_wait_ticks(void)
 {
     lock();
     bool scanning = s_scanning || s_scan_requested;
-    bool responsive = s_status.provisioning || s_provision_commands || scanning ||
+    bool responsive = s_status.provisioning || provisioning_busy_locked() || scanning ||
                       s_pending || s_submit_queued || s_save_await || s_backup_active || s_reboot_deadline;
+    int64_t close_deadline = (!s_backup_active && !s_reboot_deadline) ? s_close_deadline : 0;
+    int64_t provision_retry = s_provision_retry;
     unlock();
     int64_t wait_ms = responsive ? 100 : 1000;
     int64_t now = milliseconds();
     /* These deadlines are owned by this worker. A scan postpones reconnects,
      * so an already-due retry must not turn that scan into a busy loop. */
-    int64_t deadlines[] = {scanning ? 0 : s_next_connect, s_connect_deadline};
+    int64_t deadlines[] = {scanning ? 0 : s_next_connect, s_connect_deadline, close_deadline, provision_retry};
     for (size_t i = 0; i < sizeof(deadlines) / sizeof(deadlines[0]); ++i) {
         if (!deadlines[i]) continue;
         if (deadlines[i] <= now) return 0;
@@ -747,10 +850,7 @@ static void worker(void *context)
         /* A queued command/event interrupts this idle wait immediately. */
         if (xQueueReceive(s_commands, &command, worker_wait_ticks()) == pdTRUE) {
             switch (command.kind) {
-            case CMD_START:
-                if (start_provisioning() != ESP_OK) message("Unable to start setup Wi-Fi; try again");
-                break;
-            case CMD_STOP: stop_provisioning(); break;
+            case CMD_PROVISION: break; /* Intent is reconciled after every command. */
             case CMD_APPLY: {
                 lock();
                 bool changed = strcmp(command.config.ssid, s_config.ssid) || strcmp(command.config.password, s_config.password);
@@ -762,20 +862,30 @@ static void worker(void *context)
             case CMD_SUBMIT: {
                 lock();
                 s_submit_queued = false;
-                bool allowed = s_status.provisioning && !s_pending && !s_save_await && !s_backup_active && !s_reboot_deadline;
+                bool allowed = command.session && !s_pending && !s_save_await && !s_backup_active && !s_reboot_deadline;
+                bool reuse_connection = allowed && s_status.connected &&
+                    !strcmp(command.config.ssid, s_config.ssid) && !strcmp(command.config.password, s_config.password);
                 if (allowed) {
                     s_pending_config = command.config;
+                    s_submit_session = command.session;
                     s_pending = true;
                     s_saved = false;
                     s_submission_failed = false;
                 }
                 unlock();
                 if (allowed) {
-                    s_close_deadline = 0;
                     s_pending_deadline = milliseconds() + 45000;
+                    if (reuse_connection) {
+                        /* Username/interval-only changes need no STA restart.
+                         * got_ip still verifies the current SSID and IPv4. */
+                        s_waiting_ip = true;
+                        got_ip();
+                        lock(); bool still_pending = s_pending; unlock();
+                        if (!still_pending) break;
+                    }
                     if (connect_config(&command.config) != ESP_OK) {
                         cancel_pending();
-                        lock(); s_submission_failed = true; unlock();
+                        lock(); s_submission_failed = true; notice_locked("WIFI SETUP FAILED / PREVIOUS SETTINGS KEPT", true); unlock();
                         message("Wi-Fi configuration failed; previous settings retained");
                     } else message("Testing Wi-Fi connection; previous settings retained");
                 }
@@ -784,16 +894,31 @@ static void worker(void *context)
             case CMD_COMMIT_RESULT: {
                 lock();
                 bool awaited = s_save_await;
+                bool restore_previous = awaited && !command.reason;
+                badge_config_t previous = s_config;
+                if (restore_previous) s_status.connected = false;
                 if (awaited) {
                     s_save_await = false;
                     s_saved = command.reason != 0;
                     s_submission_failed = !s_saved;
                     if (s_saved) {
-                        snprintf(s_status.message, sizeof(s_status.message), "Saved. Wi-Fi connected; hotspot closes in 60 sec");
-                        if (s_status.provisioning) s_close_deadline = milliseconds() + 60000;
-                    } else snprintf(s_status.message, sizeof(s_status.message), "Wi-Fi connected; settings NOT saved. Please retry");
+                        s_config = s_pending_config;
+                        notice_locked("WIFI CONNECTED / SETTINGS SAVED", false);
+                        s_saved_result_id = s_status.network_notice_id;
+                        if (s_provision_requested && s_submit_session == s_status.provisioning_session) {
+                            snprintf(s_status.message, sizeof(s_status.message), "Saved. Wi-Fi connected; setup hotspot is closing");
+                            s_close_session = s_submit_session;
+                            s_close_deadline = milliseconds() + 5000;
+                        }
+                    } else {
+                        notice_locked("SETTINGS NOT SAVED / PREVIOUS SETTINGS KEPT", true);
+                        snprintf(s_status.message, sizeof(s_status.message), "Settings NOT saved. Previous settings retained; retry");
+                    }
+                    memset(&s_pending_config, 0, sizeof(s_pending_config));
                 }
                 unlock();
+                if (restore_previous) connect_config(&previous);
+                memset(&previous, 0, sizeof(previous));
                 break;
             }
             case CMD_IP: got_ip(); break;
@@ -804,7 +929,7 @@ static void worker(void *context)
                 if (command.kind == CMD_LOST_IP) esp_wifi_disconnect();
                 lock();
                 s_status.connected = false;
-                bool have_ssid = (s_pending ? s_pending_config.ssid[0] : s_config.ssid[0]) != 0;
+                bool have_ssid = ((s_pending || s_save_await) ? s_pending_config.ssid[0] : s_config.ssid[0]) != 0;
                 bool is_pending = s_pending;
                 bool ap_active = s_status.provisioning;
                 unlock();
@@ -822,11 +947,6 @@ static void worker(void *context)
             case CMD_SCAN: start_scan(); break;
             case CMD_SCAN_DONE: scan_done(command.reason); break;
             }
-            if (command.kind == CMD_START || command.kind == CMD_STOP) {
-                lock();
-                --s_provision_commands;
-                unlock();
-            }
             memset(&command, 0, sizeof(command));
         }
         int64_t now = milliseconds();
@@ -837,7 +957,7 @@ static void worker(void *context)
         if (reboot_deadline && now >= reboot_deadline) esp_restart();
         if (s_pending_deadline && now >= s_pending_deadline) {
             cancel_pending();
-            lock(); s_submission_failed = true; unlock();
+            lock(); s_submission_failed = true; notice_locked("WIFI CONNECTION FAILED / PREVIOUS SETTINGS KEPT", true); unlock();
             message("Connection failed. Previous settings retained; retry here");
         }
         if (s_scan_deadline && now >= s_scan_deadline) {
@@ -857,7 +977,15 @@ static void worker(void *context)
             esp_wifi_disconnect();
             s_next_connect = now + 5000;
         }
-        if (!backup_active && !reboot_deadline && s_close_deadline && now >= s_close_deadline) stop_provisioning();
+        lock();
+        if (!backup_active && !reboot_deadline && s_close_deadline && now >= s_close_deadline) {
+            if (s_provision_requested && s_close_session == s_status.provisioning_session)
+                s_provision_requested = false;
+            s_close_deadline = 0;
+            s_provision_retry = 0;
+        }
+        unlock();
+        reconcile_provisioning();
         poll_dns();
     }
 }
@@ -935,7 +1063,6 @@ esp_err_t badge_network_init(const badge_config_t *config,
     if (result != ESP_OK) goto failed;
     if (xTaskCreate(worker, "badge_network", 4096, NULL, 4, NULL) != pdPASS) { result = ESP_ERR_NO_MEM; goto failed; }
     s_initialized = true;
-    if (!config->ssid[0] || !config->username[0]) return badge_network_provision_start();
     return ESP_OK;
 failed:
     if (s_wifi_handler) esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_wifi_handler);
@@ -957,7 +1084,7 @@ failed:
 esp_err_t badge_network_apply(const badge_config_t *config)
 {
     if (!config || !badge_config_valid(config)) return ESP_ERR_INVALID_ARG;
-    return enqueue(CMD_APPLY, config);
+    return enqueue(CMD_APPLY, config, 0);
 }
 
 esp_err_t badge_network_config_result(bool saved)
@@ -967,8 +1094,29 @@ esp_err_t badge_network_config_result(bool saved)
     return xQueueSend(s_commands, &command, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
-esp_err_t badge_network_provision_start(void) { return enqueue(CMD_START, NULL); }
-esp_err_t badge_network_provision_stop(void) { return enqueue(CMD_STOP, NULL); }
+static esp_err_t request_provisioning(bool requested)
+{
+    if (!s_initialized || !s_commands) return ESP_ERR_INVALID_STATE;
+    lock();
+    if (requested != s_provision_requested) {
+        s_provision_requested = requested;
+        if (requested && ++s_status.provisioning_session == 0) ++s_status.provisioning_session;
+        s_provision_retry = 0;
+        s_provision_error_reported = false;
+        s_close_deadline = 0;
+    }
+    /* Closing cancels the old success grace period even if it already closed
+     * itself; a later open always gets a fresh epoch. */
+    if (!requested) s_close_deadline = 0;
+    unlock();
+    /* A full queue is already awake. Every worker iteration sees the latest
+     * intent, so losing this optional wake-up never loses a close request. */
+    (void) enqueue(CMD_PROVISION, NULL, 0);
+    return ESP_OK;
+}
+
+esp_err_t badge_network_provision_start(void) { return request_provisioning(true); }
+esp_err_t badge_network_provision_stop(void) { return request_provisioning(false); }
 
 void badge_network_status(badge_status_t *status)
 {
@@ -976,8 +1124,15 @@ void badge_network_status(badge_status_t *status)
     lock();
     status->connected = s_status.connected;
     status->provisioning = s_status.provisioning;
-    status->provisioning_busy = s_provision_commands != 0;
-    status->setup_saved = s_saved;
+    status->provisioning_busy = provisioning_busy_locked();
+    status->setup_saved = s_saved && !s_pending && !s_submit_queued && !s_save_await &&
+        s_provision_requested && s_submit_session == s_status.provisioning_ready_session;
+    status->setup_pending = s_pending || s_submit_queued || s_save_await;
+    status->provisioning_session = s_status.provisioning_session;
+    status->provisioning_ready_session = s_status.provisioning_ready_session;
+    status->network_notice_id = s_status.network_notice_id;
+    status->network_notice_error = s_status.network_notice_error;
+    snprintf(status->network_notice, sizeof(status->network_notice), "%s", s_status.network_notice);
     snprintf(status->ap_ssid, sizeof(status->ap_ssid), "%s", s_status.ap_ssid);
     snprintf(status->ap_password, sizeof(status->ap_password), "%s", s_status.ap_password);
     snprintf(status->message, sizeof(status->message), "%s", s_status.message);

@@ -89,7 +89,12 @@ typedef struct {
 
 typedef struct {
     bool connected, provisioning, syncing, setup_saved;
-    bool provisioning_busy; /* Queued/in-flight hotspot start or stop. */
+    bool provisioning_busy; /* Latest hotspot intent has not finished. */
+    bool setup_pending; /* Accepted Wi-Fi validation or durable save is pending. */
+    uint32_t provisioning_session, provisioning_ready_session;
+    uint32_t network_notice_id;
+    bool network_notice_error;
+    char network_notice[96];
     int battery_percent;
     int64_t now;
     char ap_ssid[33], ap_password[20], message[64];

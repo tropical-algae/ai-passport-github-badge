@@ -6,8 +6,31 @@
 static badge_data_t data;
 static badge_config_t config;
 
+static void provision_readiness(void)
+{
+    badge_status_t status={.provisioning=true,.provisioning_session=7,
+                           .provisioning_ready_session=7};
+    strcpy(status.ap_ssid,"GitHubBadge-A1B2C3");
+    strcpy(status.ap_password,"ABCDEFGH2345");
+    assert(badge_ui_provision_ready(&status));
+    status.provisioning_session=status.provisioning_ready_session=0;
+    assert(!badge_ui_provision_ready(&status));
+    status.provisioning_session=status.provisioning_ready_session=7;
+    status.provisioning_busy=true;assert(!badge_ui_provision_ready(&status));
+    status.provisioning_busy=false;
+    status.provisioning_session=8;assert(!badge_ui_provision_ready(&status));
+    status.provisioning_ready_session=8;assert(badge_ui_provision_ready(&status));
+    status.provisioning=false;assert(!badge_ui_provision_ready(&status));
+    status.provisioning=true;
+    status.ap_ssid[0]=0;assert(!badge_ui_provision_ready(&status));
+    strcpy(status.ap_ssid,"GitHubBadge-A1B2C3");
+    status.ap_password[0]=0;assert(!badge_ui_provision_ready(&status));
+    assert(!badge_ui_provision_ready(NULL));
+}
+
 int main(void)
 {
+    provision_readiness();
     badge_config_defaults(&config);
     snprintf(config.username,sizeof(config.username),"octocat");
     data.repo_count=3;data.scope_count=7;

@@ -45,6 +45,9 @@ static char s_avatar_account[40];
 static int64_t s_retry_not_before;
 static bool s_config_ack_pending, s_config_ack_saved;
 static bool s_provision_pending, s_provision_waiting, s_manual_pending;
+static bool s_provision_open, s_provision_stop_pending;
+static uint32_t s_provision_session, s_network_notice_id;
+static int64_t s_provision_retry_at;
 static badge_idle_t s_idle;
 /* idle.asleep is the requested state. Hardware completion is tracked separately
  * so a failed/partial transition cannot admit keys to an invisible screen. */
@@ -73,11 +76,13 @@ static void service_screen(int64_t now) {
     }
 }
 
-static void notify(const char *message, bool error) {
+static bool notify(const char *message, bool error) {
     if (bsp_lvgl_lock(1000)) {
         badge_ui_notify(message, error);
         bsp_lvgl_unlock();
+        return true;
     }
+    return false;
 }
 static bool backup_begin(char *error, size_t size) {
     if (!s_control_lock || xSemaphoreTake(s_control_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -145,6 +150,8 @@ static void start_sync(bool manual) {
     badge_network_status(&s_status);
     const char *reason = NULL;
     if (atomic_load(&s_maintenance)) reason = "BACKUP IN PROGRESS";
+    else if (s_status.setup_pending || s_config_ack_pending || uxQueueMessagesWaiting(s_configs))
+        reason = "WI-FI SETUP IN PROGRESS";
     else if (atomic_load(&s_result_ready)) reason = "FINISHING LAST FETCH";
     else if (atomic_load(&s_syncing)) reason = "FETCH ALREADY RUNNING";
     else if (!s_storage_ok) reason = "CACHE STORAGE UNAVAILABLE";
@@ -164,11 +171,16 @@ static void start_sync(bool manual) {
     /* Automatic retries obey the stored schedule. Manual attempts enter the
      * collector, whose persistent per-bucket limits remain authoritative. */
     if (!manual && !badge_sync_due(&s_data, &s_config, s_status.now)) return;
-    if (s_status.provisioning || s_status.provisioning_busy || s_provision_pending || s_provision_waiting) {
+    if (s_status.provisioning || s_status.provisioning_busy || s_provision_open ||
+        s_provision_pending || s_provision_waiting || s_provision_stop_pending) {
         if (manual) {
             if (badge_network_provision_stop() == ESP_OK) {
                 s_manual_pending = true;
                 s_provision_pending = s_provision_waiting = false;
+                s_provision_stop_pending = false;
+                s_provision_open = false;
+                s_idle.last_activity = esp_timer_get_time();
+                if (bsp_lvgl_lock(1000)) { badge_ui_close_provision(); bsp_lvgl_unlock(); }
                 notify("CLOSING SETUP / FETCH NEXT", false);
             } else {
                 s_manual_pending = false;
@@ -245,9 +257,17 @@ static void load_avatar(void) {
     }
     free(next);
 }
+static badge_status_t display_status(void) {
+    badge_status_t view = s_status;
+    /* A new dialog must never reuse credentials while its start is deferred. */
+    if (s_provision_open && (s_provision_pending || !s_provision_session))
+        view.provisioning_busy = true;
+    return view;
+}
 static void refresh_ui(void) {
     if (bsp_lvgl_lock(1000)) {
-        badge_ui_update(&s_data, &s_config, &s_status);
+        badge_status_t view = display_status();
+        badge_ui_update(&s_data, &s_config, &view);
         bsp_lvgl_unlock();
     }
 }
@@ -279,13 +299,22 @@ static void perform_action(badge_input_action_t key) {
     case BADGE_ACTION_PROVISION:
         /* Do not overlap the AP/server startup peak with an in-flight TLS
          * handshake. Queue setup until the background fetch finishes. */
+        s_provision_open = true;
+        s_provision_session = 0;
         s_provision_pending = true;
         s_provision_waiting = false;
+        s_provision_retry_at = 0;
+        s_status.provisioning_busy = true;
+        s_idle.last_activity = esp_timer_get_time();
         if (atomic_load(&s_syncing)) notify("FETCH RUNNING\nSETUP AFTER FETCH", false);
         break;
     case BADGE_ACTION_CLOSE_PROVISION:
+        s_provision_open = false;
         s_provision_pending = s_provision_waiting = false;
-        badge_network_provision_stop();
+        s_provision_stop_pending = badge_network_provision_stop() != ESP_OK;
+        s_provision_retry_at = esp_timer_get_time() + 1000000;
+        s_idle.last_activity = esp_timer_get_time();
+        if (s_provision_stop_pending) notify("CLOSING HOTSPOT / RETRYING", true);
         break;
     case BADGE_ACTION_SYNC: start_sync(true); break;
     default: break;
@@ -297,7 +326,9 @@ static void app_task(void *context) {
     badge_input_init(&input);
     badge_idle_init(&s_idle, esp_timer_get_time());
     int64_t battery_at = 0, tick_at = 0;
-    bool last_syncing = false, last_setup_saved = false;
+    bool last_syncing = false;
+    bool last_ap = false, last_ap_busy = false;
+    uint32_t last_ap_session = 0, last_ready_session = 0;
     for (;;) {
         /* Never hold the maintenance gate while waiting for input. The HTTP
          * task has the same priority: releasing and immediately retaking this
@@ -308,8 +339,24 @@ static void app_task(void *context) {
         bool have_key = xQueueReceive(s_keys, &event, key_wait) == pdTRUE;
         xSemaphoreTake(s_control_lock, portMAX_DELAY);
         if (atomic_load(&s_maintenance)) {
-            xQueueReset(s_keys);
-            badge_input_init(&input);
+            /* Backup owns storage, not the setup window. Only its close gesture
+             * is admitted here; stopping AP services never waits in this task
+             * or cancels a Flash commit already in progress. */
+            if (atomic_exchange(&s_key_overflow, false)) {
+                badge_input_init(&input);
+                xQueueReset(s_keys);
+                have_key = false;
+            }
+            if (input.key != BSP_BTN_OK) badge_input_init(&input);
+            if (have_key) {
+                do {
+                    if (s_provision_open && event.key == BSP_BTN_OK)
+                        perform_action(badge_input_edge(&input, event.key,
+                            event.event == BSP_BTN_PRESS, event.at));
+                } while (xQueueReceive(s_keys, &event, 0) == pdTRUE);
+            }
+            if (s_provision_open) perform_action(badge_input_poll(&input, esp_timer_get_time()));
+            else badge_input_init(&input);
             badge_idle_cancel_keys(&s_idle, esp_timer_get_time());
             xSemaphoreGive(s_control_lock);
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -350,19 +397,19 @@ static void app_task(void *context) {
             for (size_t i = 0; configured.username[i]; ++i)
                 configured.username[i] = (char)tolower((unsigned char)configured.username[i]);
             bool account_changed = strcasecmp(configured.username, s_config.username) != 0;
-            /* Ordinary UI/preferences never cancel a background job. A new
-             * account invalidates only the old account's in-flight request. */
-            if (account_changed && atomic_load(&s_syncing)) badge_sync_cancel();
             configured.theme = s_config.theme;
             configured.brightness = s_config.brightness;
             configured.screen_timeout_min = s_config.screen_timeout_min;
-            s_config = configured;
-            bool saved = badge_config_save(&s_config);
+            bool saved = badge_config_save(&configured);
             s_config_ack_saved = saved;
             s_config_ack_pending = true;
-            if (!saved)
-                snprintf(s_status.message, sizeof(s_status.message), "CONFIG NOT SAVED");
-            if (account_changed) {
+            if (saved) {
+                /* Closing setup never cancels collection. Only a committed
+                 * account change invalidates that account's old request. */
+                if (account_changed && atomic_load(&s_syncing)) badge_sync_cancel();
+                s_config = configured;
+            } else snprintf(s_status.message, sizeof(s_status.message), "CONFIG NOT SAVED");
+            if (saved && account_changed) {
                 badge_data_t *restored = malloc(sizeof(*restored));
                 if (restored) {
                     badge_data_reset(restored, s_config.username);
@@ -373,7 +420,8 @@ static void app_task(void *context) {
                 while (!bsp_lvgl_lock(1000)) vTaskDelay(pdMS_TO_TICKS(10));
                 if (restored) s_data = *restored;
                 else badge_data_reset(&s_data, s_config.username);
-                badge_ui_update(&s_data, &s_config, &s_status);
+                badge_status_t view = display_status();
+                badge_ui_update(&s_data, &s_config, &view);
                 bsp_lvgl_unlock();
                 free(restored);
                 s_retry_not_before = 0;
@@ -392,7 +440,8 @@ static void app_task(void *context) {
             if (strcasecmp(s_mail.username, s_config.username) == 0) {
                 if (bsp_lvgl_lock(1000)) {
                     s_data = s_mail;
-                    badge_ui_update(&s_data, &s_config, &s_status);
+                    badge_status_t view = display_status();
+                    badge_ui_update(&s_data, &s_config, &view);
                     bsp_lvgl_unlock();
                     changed = true;
                     s_mail_ready = false;
@@ -404,13 +453,24 @@ static void app_task(void *context) {
         result_ready = result_ready && !mail_pending;
         s_status.now = time(NULL);
         badge_network_status(&s_status);
-        if (s_status.setup_saved && !last_setup_saved && bsp_lvgl_lock(1000)) {
+        if (s_status.network_notice_id != s_network_notice_id &&
+            notify(s_status.network_notice, s_status.network_notice_error))
+            s_network_notice_id = s_status.network_notice_id;
+        if (s_provision_waiting && !s_status.provisioning_busy) s_provision_waiting = false;
+        /* Network owns success delivery to the phone and actual AP shutdown.
+         * A completion from an older session must not dismiss a newer dialog. */
+        if (s_provision_open && !s_provision_pending && s_provision_session &&
+            s_status.provisioning_session == s_provision_session &&
+            !s_status.provisioning && !s_status.provisioning_busy && bsp_lvgl_lock(1000)) {
             badge_ui_close_provision();
-            badge_ui_notify("WIFI CONNECTED / SAVED", false);
             bsp_lvgl_unlock();
+            s_provision_open = false;
+            s_idle.last_activity = esp_timer_get_time();
         }
-        last_setup_saved = s_status.setup_saved;
-        if (s_status.provisioning || !s_status.provisioning_busy) s_provision_waiting = false;
+        bool ap_changed = last_ap != s_status.provisioning || last_ap_busy != s_status.provisioning_busy ||
+            last_ap_session != s_status.provisioning_session || last_ready_session != s_status.provisioning_ready_session;
+        last_ap = s_status.provisioning; last_ap_busy = s_status.provisioning_busy;
+        last_ap_session = s_status.provisioning_session; last_ready_session = s_status.provisioning_ready_session;
         s_status.syncing = atomic_load(&s_syncing);
         if (changed) s_avatar_pending = true;
         if (s_avatar_pending || (result_ready && !s_avatar_decoded)) load_avatar();
@@ -433,21 +493,36 @@ static void app_task(void *context) {
                 notify(message, s_sync_error != ESP_OK || ((s_data.valid & BADGE_AVATAR) && !s_avatar_decoded));
             }
         }
-        if (changed || last_syncing != s_status.syncing) refresh_ui();
+        if (changed || ap_changed || last_syncing != s_status.syncing) refresh_ui();
         last_syncing = s_status.syncing;
         /* Load/decode the final cached image before starting another memory
          * intensive service, and never overlap AP startup with TLS. */
-        if (s_provision_pending && !atomic_load(&s_syncing) && !atomic_load(&s_result_ready) && !s_avatar_pending) {
-            s_provision_pending = false;
-            if (badge_network_provision_start() == ESP_OK) s_provision_waiting = true;
-            else snprintf(s_status.message, sizeof(s_status.message), "SETUP START FAILED");
+        int64_t monotonic = esp_timer_get_time();
+        if (s_provision_stop_pending && monotonic >= s_provision_retry_at) {
+            s_provision_stop_pending = badge_network_provision_stop() != ESP_OK;
+            s_provision_retry_at = monotonic + 1000000;
         }
-        if (s_manual_pending && !s_status.provisioning && !s_status.provisioning_busy) {
+        if (s_provision_open && s_provision_pending && !s_provision_stop_pending &&
+            monotonic >= s_provision_retry_at && !atomic_load(&s_syncing) &&
+            !atomic_load(&s_result_ready) && !s_avatar_pending) {
+            if (badge_network_provision_start() == ESP_OK) {
+                s_provision_pending = false;
+                s_provision_waiting = true;
+                badge_network_status(&s_status);
+                s_provision_session = s_status.provisioning_session;
+            } else {
+                s_provision_retry_at = monotonic + 1000000;
+                notify("HOTSPOT START FAILED / RETRYING", true);
+            }
+        }
+        if (s_manual_pending && !s_provision_open && !s_provision_pending && !s_provision_stop_pending &&
+            !s_status.provisioning && !s_status.provisioning_busy && !s_status.setup_pending &&
+            !s_config_ack_pending && !uxQueueMessagesWaiting(s_configs)) {
             s_manual_pending = false;
             start_sync(true);
         }
-        int64_t monotonic = esp_timer_get_time();
-        badge_idle_tick(&s_idle, s_config.screen_timeout_min, monotonic);
+        if (s_provision_open) s_idle.last_activity = monotonic;
+        else badge_idle_tick(&s_idle, s_config.screen_timeout_min, monotonic);
         service_screen(monotonic);
         if (monotonic >= battery_at) {
             s_status.battery_percent = bsp_battery_soc();
@@ -455,7 +530,8 @@ static void app_task(void *context) {
         }
         if (monotonic >= tick_at) {
             if (bsp_lvgl_lock(500)) {
-                badge_ui_tick(&s_status);
+                badge_status_t view = display_status();
+                badge_ui_tick(&view);
                 bsp_lvgl_unlock();
             }
             tick_at = monotonic + 1000000;
@@ -501,7 +577,7 @@ void app_main(void) {
         refresh_ui();
     }
     if (!badge_config_valid(&s_config) && network == ESP_OK) {
-        badge_network_provision_start();
+        s_provision_open = s_provision_pending = true;
         if (bsp_lvgl_lock(1000)) { badge_ui_show_provision(); bsp_lvgl_unlock(); }
     }
     ESP_ERROR_CHECK(bsp_button_init(on_key, NULL));

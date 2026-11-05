@@ -148,4 +148,111 @@ async function main() {
     assert.equal(calls.some(call => call.url === '/api/config'), false);
     console.log('Badge portal UI scan/backup isolation tests: PASS');
 }
-main().catch(error => { console.error(error); process.exitCode = 1; });
+
+async function setupAcknowledgement(initiallySaved = false) {
+    const ids = ['setup', 'status', 'error', 'save', 'scan', 'scan_status', 'networks', 'ssid', 'password', 'open_network', 'username', 'interval', 'nonce', 'utc_offset', 'export', 'backup_download', 'restore', 'restore_file', 'backup_status'];
+    const elements = Object.fromEntries(ids.map(id => [id, new Element()]));
+    const nonce = '0123456789abcdef0123456789abcdef';
+    const state = {ssid: 'Saved', username: 'octocat', interval: 6, nonce, open: false, pending: false, saved: initiallySaved, saved_result_id: 1, message: 'Ready'};
+    const calls = [];
+    let ackFails = !initiallySaved, offline = false, replaceResultDuringAck = false;
+    const context = vm.createContext({
+        document: {querySelector: selector => elements[selector.slice(1)], getElementById: id => elements[id], createElement: () => new Element()},
+        window: {addEventListener() {}}, Date, URLSearchParams, URL: {}, setTimeout() {},
+        FormData: class { [Symbol.iterator]() { return Object.entries({ssid: 'New network', password: '', username: 'octocat', interval: '6', nonce})[Symbol.iterator](); } },
+        fetch: async (url, options = {}) => {
+            calls.push({url, options});
+            if (offline) throw new Error('Hotspot closed');
+            if (url === '/api/state') return {ok: true, json: async () => ({...state})};
+            if (url === '/api/networks') return {ok: true, json: async () => ({scanning: false, message: 'Ready', networks: []})};
+            if (url === '/api/ack') {
+                assert.equal(options.method, 'POST');
+                assert.equal(options.headers['X-Setup-Nonce'], nonce);
+                assert.equal(options.headers['X-Setup-Result'], String(state.saved_result_id));
+                assert.equal(options.body, undefined);
+                assert.match(elements.status.textContent, /^Saved\. Wi-Fi connected\./, 'Show the received success before acknowledging shutdown');
+                assert.equal(elements.save.disabled, true);
+                if (replaceResultDuringAck) {
+                    // Another tab completes a later save before this delayed
+                    // ACK is checked; the server rejects the earlier result ID.
+                    replaceResultDuringAck = false;
+                    ++state.saved_result_id;
+                    return {ok: false, status: 409};
+                }
+                if (ackFails) throw new Error('Lost acknowledgement response');
+            }
+            return {ok: true, json: async () => ({message: 'Testing Wi-Fi'})};
+        }
+    });
+    const html = fs.readFileSync(path.join(__dirname, '../main/badge_portal.html'), 'utf8');
+    vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], context);
+    const settle = async () => { for (let i = 0; i < 8; ++i) await new Promise(resolve => setImmediate(resolve)); };
+    await settle();
+    if (!initiallySaved) {
+        assert.equal(calls.some(call => call.url === '/api/ack'), false);
+        await elements.setup.fire('submit');
+        state.pending = true;
+        await vm.runInContext('refresh()', context);
+        assert.equal(calls.some(call => call.url === '/api/ack'), false, 'HTTP 202 and a pending save do not acknowledge success');
+        state.pending = false;
+        state.message = 'Settings NOT saved. Previous settings retained; retry';
+        await vm.runInContext('refresh()', context);
+        assert.equal(elements.save.disabled, false);
+        assert.equal(calls.some(call => call.url === '/api/ack'), false, 'Failed persistence keeps setup open');
+        state.saved = true;
+        await vm.runInContext('refresh()', context);
+        assert.equal(calls.filter(call => call.url === '/api/ack').length, 1);
+        assert.match(elements.status.textContent, /^Saved\./, 'A lost ACK response must not turn a saved result into a failure');
+        ackFails = false;
+        await vm.runInContext('refresh()', context);
+        assert.equal(calls.filter(call => call.url === '/api/ack').length, 2, 'Retry a lost acknowledgement');
+    } else {
+        assert.equal(calls.filter(call => call.url === '/api/ack').length, 1, 'A reloaded page can acknowledge an already-saved result');
+        assert.equal(calls.some(call => call.url === '/api/scan'), false);
+    }
+    const ackCount = calls.filter(call => call.url === '/api/ack').length;
+    await vm.runInContext('refresh()', context);
+    assert.equal(calls.filter(call => call.url === '/api/ack').length, ackCount);
+    const before = calls.length;
+    await elements.setup.fire('submit');
+    await elements.export.fire('click');
+    assert.equal(calls.length, before, 'Do not start another operation during successful shutdown');
+    state.saved = false;
+    state.saved_result_id = 0;
+    state.pending = true;
+    state.message = 'Testing a newer submission';
+    await vm.runInContext('refresh()', context);
+    assert.equal(calls.filter(call => call.url === '/api/ack').length, ackCount, 'A newer pending submission invalidates the earlier success');
+    assert.equal(elements.status.textContent, state.message);
+    assert.equal(elements.save.disabled, true);
+    state.pending = false;
+    state.message = 'The newer settings were not saved';
+    await vm.runInContext('refresh()', context);
+    assert.equal(elements.save.disabled, false, 'The earlier success must not permanently disable this tab');
+    state.saved = true;
+    state.saved_result_id = 2;
+    await vm.runInContext('refresh()', context);
+    assert.equal(calls.filter(call => call.url === '/api/ack').length, ackCount + 1, 'A later successful submission needs its own acknowledgement');
+    state.saved_result_id = 3;
+    replaceResultDuringAck = true;
+    await vm.runInContext('refresh()', context);
+    assert.equal(calls.filter(call => call.url === '/api/ack').at(-1).options.headers['X-Setup-Result'], '3');
+    await vm.runInContext('refresh()', context);
+    assert.equal(calls.filter(call => call.url === '/api/ack').at(-1).options.headers['X-Setup-Result'], '4', 'Do not reuse an old ACK across saves within the same setup session');
+    const validAckCount = calls.filter(call => call.url === '/api/ack').length;
+    for (const invalid of [undefined, 0, -1, 1.5, 4294967296, '4']) {
+        state.saved_result_id = invalid;
+        await vm.runInContext('refresh()', context);
+    }
+    assert.equal(calls.filter(call => call.url === '/api/ack').length, validAckCount, 'Do not send acknowledgements without a valid result ID');
+    offline = true;
+    for (let i = 0; i < 3; ++i) await vm.runInContext('refresh()', context);
+    assert.match(elements.status.textContent, /hotspot closed.*badge is ready/i);
+}
+
+(async () => {
+    await main();
+    await setupAcknowledgement();
+    await setupAcknowledgement(true);
+    console.log('Badge portal saved-result acknowledgement tests: PASS');
+})().catch(error => { console.error(error); process.exitCode = 1; });

@@ -3,6 +3,13 @@
 const uint8_t badge_screen_timeout_minutes[BADGE_SCREEN_TIMEOUT_COUNT] = {1, 5, 10, 30, 60, 0};
 const uint8_t badge_brightness_percent[BADGE_BRIGHTNESS_COUNT] = {100, 80, 60, 40, 20, 10};
 
+bool badge_ui_provision_ready(const badge_status_t *s)
+{
+    return s && s->provisioning && !s->provisioning_busy && s->provisioning_session &&
+           s->provisioning_session == s->provisioning_ready_session &&
+           s->ap_ssid[0] && s->ap_password[0];
+}
+
 static uint8_t wrapped(uint8_t value, int delta, unsigned count)
 {
     return count ? (uint8_t)(((int)value + delta + (int)count) % (int)count) : 0;

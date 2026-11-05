@@ -8,7 +8,7 @@
 </style>
 <main><header><small>GITHUB / PERSONAL PASSPORT</small><h1>CONNECT & CONFIGURE</h1></header>
 <p class="note">Connect the badge to a 2.4 GHz Wi-Fi network and choose any public GitHub account. No GitHub password or token is needed.</p>
-<p class="note" lang="zh-CN">请填写 2.4 GHz Wi-Fi 和 GitHub 用户名。连接成功后保存设置，热点将在 60 秒后关闭；断网时继续显示上次数据。</p>
+<p class="note" lang="zh-CN">请填写 2.4 GHz Wi-Fi 和 GitHub 用户名。连接并保存成功后会显示结果，然后自动关闭热点；断网时继续显示上次数据。</p>
 <section aria-labelledby="networks-title"><h2 id="networks-title">NEARBY WI-FI / 2.4 GHz</h2>
 <div id="networks"></div><small id="scan_status" role="status">Load settings to scan nearby networks.</small>
 <button id="scan" class="secondary" type="button" disabled>REFRESH NETWORKS</button>
@@ -40,9 +40,9 @@ const ssid=document.querySelector('#ssid'),password=document.querySelector('#pas
 const backupDownload=document.querySelector('#backup_download');
 const exportButton=document.querySelector('#export'),restoreButton=document.querySelector('#restore'),restoreFile=document.querySelector('#restore_file'),backupStatus=document.querySelector('#backup_status');
 let backupUrl='';
-let loaded=false,busy=false,accepted=false,finished=false,failures=0,pending=false,scanning=false,networkKey='',restarting=false;
+let loaded=false,busy=false,finished=false,acknowledged=0,failures=0,pending=false,scanning=false,networkKey='',restarting=false;
 document.querySelector('#utc_offset').value=-new Date().getTimezoneOffset();
-function buttons(){const disabled=!loaded||busy||pending||restarting;save.disabled=disabled;scanButton.disabled=disabled||scanning;exportButton.disabled=disabled;restoreButton.disabled=disabled||!restoreFile.files.length;restoreFile.disabled=busy||pending||restarting;backupDownload.hidden=!backupUrl||disabled;}
+function buttons(){const disabled=!loaded||busy||pending||restarting||finished;save.disabled=disabled;scanButton.disabled=disabled||scanning;exportButton.disabled=disabled;restoreButton.disabled=disabled||!restoreFile.files.length;restoreFile.disabled=busy||pending||restarting||finished;backupDownload.hidden=!backupUrl||disabled;}
 function setOpen(value){openNetwork.checked=value;password.disabled=value;}
 openNetwork.addEventListener('change',()=>setOpen(openNetwork.checked));
 ssid.addEventListener('input',()=>{setOpen(false);networks.querySelectorAll('button').forEach(button=>button.setAttribute('aria-pressed','false'));});
@@ -51,7 +51,7 @@ function renderNetworks(items){
  for(const item of items){const button=document.createElement('button'),name=document.createElement('span'),detail=document.createElement('small');
   button.type='button';button.className='network';button.setAttribute('aria-pressed',String(ssid.value===item.ssid));name.textContent=item.ssid;
   detail.textContent=(item.open?'OPEN':'LOCKED')+' / '+item.rssi+' dBm';button.append(name,detail);
-  button.addEventListener('click',()=>{if(busy||pending)return;if(ssid.value!==item.ssid)password.value='';ssid.value=item.ssid;setOpen(item.open);
+  button.addEventListener('click',()=>{if(busy||pending||finished)return;if(ssid.value!==item.ssid)password.value='';ssid.value=item.ssid;setOpen(item.open);
    networks.querySelectorAll('button').forEach(other=>other.setAttribute('aria-pressed',String(other===button)));if(!item.open)password.focus();});networks.append(button);
  }
 }
@@ -59,7 +59,7 @@ async function refreshNetworks(){
  try{const response=await fetch('/api/networks',{cache:'no-store'});if(!response.ok)return;const data=await response.json();scanning=data.scanning;scanStatus.textContent=data.message;renderNetworks(data.networks);buttons();}catch(e){}
 }
 async function scan(){
- if(!loaded||busy||pending||scanning)return;scanning=true;buttons();scanStatus.textContent='Scanning nearby 2.4 GHz networks…';
+ if(!loaded||busy||pending||scanning||finished)return;scanning=true;buttons();scanStatus.textContent='Scanning nearby 2.4 GHz networks…';
  try{const response=await fetch('/api/scan',{method:'POST',headers:{'X-Setup-Nonce':document.querySelector('#nonce').value}});const data=await response.json();
   if(!response.ok)throw new Error(data.message||'Unable to scan');scanStatus.textContent=data.message;
  }catch(e){scanning=false;scanStatus.textContent=e.message;}finally{buttons();}
@@ -67,26 +67,31 @@ async function scan(){
 scanButton.addEventListener('click',scan);
 async function refresh(){
  try{const response=await fetch('/api/state',{cache:'no-store'});if(!response.ok)throw new Error('Device unavailable');const data=await response.json();failures=0;
-  if(!loaded){for(const key of ['ssid','username','interval','nonce'])document.getElementById(key).value=data[key];setOpen(data.open);loaded=true;scan();}
-  pending=data.pending;status.textContent=data.message;buttons();
-  if(accepted&&data.saved){finished=true;status.textContent='Saved. Wi-Fi connected. The setup hotspot closes in 60 seconds. You can return to your normal network.';}
-  await refreshNetworks();
+  pending=data.pending;
+  if(!loaded){for(const key of ['ssid','username','interval','nonce'])document.getElementById(key).value=data[key];setOpen(data.open);loaded=true;if(!data.saved)scan();}
+  finished=Boolean(data.saved);if(!finished)acknowledged=0;
+  status.textContent=finished?'Saved. Wi-Fi connected. Closing the setup hotspot. You can return to your normal network.':data.message;
+  buttons();
+  // The device closes only after this browser has received the saved result.
+  // A missing acknowledgement still permits the device's short fallback.
+  if(finished&&Number.isInteger(data.saved_result_id)&&data.saved_result_id>0&&data.saved_result_id<=4294967295&&acknowledged!==data.saved_result_id){try{const ack=await fetch('/api/ack',{method:'POST',headers:{'X-Setup-Nonce':document.querySelector('#nonce').value,'X-Setup-Result':String(data.saved_result_id)}});if(ack.ok)acknowledged=data.saved_result_id;}catch(e){}}
+  if(!finished)await refreshNetworks();
  }catch(e){if(++failures>2){status.textContent=finished?'Setup hotspot closed. Your badge is ready.':'Cannot reach the badge. Stay on its setup Wi-Fi and reload this page.';}}
  if(!restarting&&(!finished||failures<3))setTimeout(refresh,3000);
 }
-form.addEventListener('submit',async e=>{e.preventDefault();if(busy||pending)return;busy=true;buttons();error.textContent='';
+form.addEventListener('submit',async e=>{e.preventDefault();if(busy||pending||finished)return;busy=true;buttons();error.textContent='';
  try{const values=new URLSearchParams(new FormData(form));if(!values.has('password'))values.set('password','');
   const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:values.toString()});const data=await response.json();
-  if(!response.ok)throw new Error(data.message||'Unable to save settings');accepted=true;finished=false;pending=true;status.textContent=data.message;
+  if(!response.ok)throw new Error(data.message||'Unable to save settings');finished=false;acknowledged=0;pending=true;status.textContent=data.message;
  }catch(e){error.textContent=e.message;}finally{busy=false;buttons();}
 });
 restoreFile.addEventListener('change',buttons);
 function clearBackup(){if(backupUrl)URL.revokeObjectURL(backupUrl);backupUrl='';backupDownload.removeAttribute('href');backupDownload.hidden=true;}
 window.addEventListener('pagehide',clearBackup);
-backupDownload.addEventListener('click',event=>{if(!backupUrl||busy||pending||restarting)event.preventDefault();});
+backupDownload.addEventListener('click',event=>{if(!backupUrl||busy||pending||restarting||finished)event.preventDefault();});
 async function responseError(response,fallback){try{const data=await response.json();return data.message||fallback;}catch(e){return fallback;}}
 exportButton.addEventListener('click',async()=>{
- if(!loaded||busy||pending||restarting)return;clearBackup();busy=true;buttons();backupStatus.textContent='Preparing local backup…';
+ if(!loaded||busy||pending||restarting||finished)return;clearBackup();busy=true;buttons();backupStatus.textContent='Preparing local backup…';
  try{const response=await fetch('/api/backup',{cache:'no-store',headers:{'X-Setup-Nonce':document.querySelector('#nonce').value}});
   if(!response.ok)throw new Error(await responseError(response,'Backup failed. Please retry.'));
   const blob=await response.blob();if(blob.size<28||blob.size>128*1024)throw new Error('Invalid backup size. Please retry.');
@@ -99,7 +104,7 @@ exportButton.addEventListener('click',async()=>{
  if(backupUrl){try{backupDownload.click();}catch(e){backupDownload.focus();}}
 });
 restoreButton.addEventListener('click',async()=>{
- if(busy||pending||restarting)return;const file=restoreFile.files[0];if(!file)return;
+ if(busy||pending||restarting||finished)return;const file=restoreFile.files[0];if(!file)return;
  if(!file.size||file.size>128*1024){backupStatus.textContent='Choose a non-empty badge backup, at most 128 KiB.';return;}
  clearBackup();busy=true;buttons();backupStatus.textContent='Validating backup and restoring… Keep the badge powered on.';
  try{const response=await fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Setup-Nonce':document.querySelector('#nonce').value},body:file});

@@ -30,6 +30,10 @@ static unsigned test_data_saves, test_backlight_writes, test_sync_calls;
 static unsigned test_lvgl_locks, test_steps, test_step_index;
 static bool test_ap_active, test_lvgl_held;
 static unsigned test_stop_queued, test_start_queued;
+static bool test_ap_desired, test_setup_pending, test_stop_failure, test_start_failure;
+static bool test_config_ack_saved, test_notice_error;
+static uint32_t test_ap_session, test_ready_session, test_notice_id;
+static char test_notice[96];
 static bool test_running_app, test_running_worker, test_task_failure;
 static int64_t test_monotonic;
 static time_t test_epoch;
@@ -236,23 +240,37 @@ esp_err_t badge_network_init(const badge_config_t *config, badge_network_config_
 esp_err_t badge_network_provision_start(void)
 {
     assert(!atomic_load(&s_syncing) && !test_worker.alive);
-    ++test_start_queued;
+    if (test_start_failure) return ESP_FAIL;
+    if (!test_ap_desired) ++test_ap_session;
+    test_ap_desired = true;
+    test_start_queued = 1;
+    test_stop_queued = 0;
     ++test_ap_starts;
     return ESP_OK;
 }
 esp_err_t badge_network_provision_stop(void)
 {
-    ++test_stop_queued;
+    if (test_stop_failure) return ESP_FAIL;
+    test_ap_desired = false;
+    test_stop_queued = 1;
+    test_start_queued = 0;
     ++test_ap_stops;
     return ESP_OK;
 }
-esp_err_t badge_network_config_result(bool saved) { assert(saved); return ESP_OK; }
+esp_err_t badge_network_config_result(bool saved)
+{ test_config_ack_saved = saved; return ESP_OK; }
 void badge_network_status(badge_status_t *status)
 {
     if (test_finish_on_status) { test_finish_on_status = false; finish_worker(); }
     status->connected = true;
     status->provisioning = test_ap_active;
     status->provisioning_busy = test_start_queued || test_stop_queued;
+    status->provisioning_session = test_ap_session;
+    status->provisioning_ready_session = test_ready_session;
+    status->setup_pending = test_setup_pending;
+    status->network_notice_id = test_notice_id;
+    status->network_notice_error = test_notice_error;
+    snprintf(status->network_notice, sizeof(status->network_notice), "%s", test_notice);
     status->setup_saved = false;
 }
 void badge_sync_cancel(void) { ++test_cancel_calls; }
@@ -297,6 +315,10 @@ static void reset_fixture(void)
     test_ap_starts = test_ap_stops = test_saves = test_data_saves = test_sync_calls = 0;
     test_backlight_writes = test_lvgl_locks = 0;
     test_ap_active = false;
+    test_ap_desired = test_setup_pending = test_stop_failure = test_start_failure = false;
+    test_config_ack_saved = test_notice_error = false;
+    test_ap_session = test_ready_session = test_notice_id = 0;
+    test_notice[0] = 0;
     test_stop_queued = 0;
     test_start_queued = 0;
     test_task_failure = false;
@@ -319,6 +341,9 @@ static void reset_fixture(void)
     s_retry_not_before = 0;
     s_config_ack_pending = s_config_ack_saved = false;
     s_provision_pending = s_provision_waiting = s_manual_pending = false;
+    s_provision_open = s_provision_stop_pending = false;
+    s_provision_session = s_network_notice_id = 0;
+    s_provision_retry_at = 0;
     atomic_store(&s_syncing, false); atomic_store(&s_key_overflow, false);
     atomic_store(&s_maintenance, false); atomic_store(&s_result_ready, false);
     s_keys = xQueueCreate(16, sizeof(key_event_t));
@@ -359,12 +384,14 @@ static void process_network_start(void)
     assert(test_start_queued && !atomic_load(&s_syncing));
     --test_start_queued;
     test_ap_active = true;
+    test_ready_session = test_ap_session;
 }
 static void process_network_stop(void)
 {
     assert(test_stop_queued);
     --test_stop_queued;
     test_ap_active = false;
+    test_ready_session = 0;
 }
 static void process_network_commands(void)
 {
@@ -457,26 +484,19 @@ static void fetch_waits_for_queued_ap_commands(void)
     choose_setting(3);
     run_app(1, NULL);
     assert(test_start_queued == 1 && !test_ap_active && !test_task_creates);
-    press(BADGE_KEY_OK, false); /* close before the AP START is processed */
-    choose_setting(4); /* refresh queues another STOP, then waits */
-    assert(test_stop_queued == 2 && s_manual_pending && !test_task_creates);
+    press(BADGE_KEY_OK, false); /* Latest close supersedes an unprocessed open. */
+    choose_setting(4);
+    assert(test_stop_queued == 1 && !test_start_queued && s_manual_pending);
     press(BADGE_KEY_OK, true);
     run_app(1, NULL);
     assert(s_manual_pending && !test_task_creates);
-    process_network_start();
-    run_app(1, NULL);
-    assert(test_ap_active && s_manual_pending && !test_task_creates);
-    process_network_stop();
-    run_app(1, NULL);
-    assert(!test_ap_active && test_stop_queued == 1 && s_manual_pending && !test_task_creates);
-    process_network_stop();
+    process_network_commands();
     run_app(1, NULL);
     assert(!s_manual_pending && atomic_load(&s_syncing) && test_task_creates == 1 && s_job_manual);
     assert(!test_cancel_calls);
     finish_worker();
     run_app(1, NULL);
 
-    /* Scheduled sync has the same protection after a fast setup close. */
     reset_fixture();
     s_data.last_attempt = s_data.last_success = 0;
     choose_setting(3);
@@ -484,13 +504,124 @@ static void fetch_waits_for_queued_ap_commands(void)
     assert(test_start_queued == 1 && !test_task_creates);
     press(BADGE_KEY_OK, false);
     run_app(1, NULL);
-    assert(test_stop_queued == 1 && !test_task_creates);
-    process_network_start();
-    run_app(1, NULL);
-    assert(!test_task_creates);
-    process_network_stop();
+    assert(test_stop_queued == 1 && !test_start_queued && !test_task_creates);
+    process_network_commands();
     run_app(1, NULL);
     assert(test_task_creates == 1 && !s_job_manual && !test_cancel_calls);
+}
+
+static void setup_close_preserves_submission_and_failed_save(void)
+{
+    reset_fixture();
+    choose_setting(3);
+    run_app(1, NULL);
+    process_network_commands();
+    run_app(1, NULL);
+    test_setup_pending = true;
+    press(BADGE_KEY_OK, false);
+    assert(!s_provision_open && test_setup_pending && !test_cancel_calls);
+    process_network_commands();
+    s_data.last_attempt = s_data.last_success = 0;
+    test_monotonic += 1000000;
+    run_app(1, NULL);
+    assert(!test_task_creates && test_setup_pending);
+    badge_config_t changed = s_config;
+    snprintf(changed.username, sizeof(changed.username), "new-account");
+    test_save_failure = true;
+    on_config(&changed, NULL);
+    run_app(1, NULL);
+    assert(!test_config_ack_saved && !strcmp(s_config.username, "octocat"));
+    assert(!strcmp(s_data.username, "octocat") && !test_cancel_calls);
+    test_setup_pending = false;
+    test_notice_id = 1; test_notice_error = true;
+    snprintf(test_notice, sizeof(test_notice), "CONFIG NOT SAVED");
+    run_app(1, NULL);
+    assert(strstr(test_notification, "CONFIG NOT SAVED"));
+    assert(test_ui.modal == BADGE_MODAL_NONE);
+}
+
+static void setup_awake_hook(unsigned step)
+{
+    if (step == 1) {
+        assert(s_provision_open && !s_idle.asleep);
+        test_monotonic += 120000000;
+    } else if (step == 2) {
+        assert(s_provision_open && !s_idle.asleep);
+        test_notice_id = 1;
+        snprintf(test_notice, sizeof(test_notice), "WIFI CONNECTED / SAVED");
+    } else if (step == 3) {
+        assert(test_ui.modal == BADGE_MODAL_WIFI && test_ap_active);
+        assert(strstr(test_notification, "SAVED"));
+        test_ap_active = test_ap_desired = false; test_ready_session = 0;
+    } else if (step == 4) {
+        assert(!s_provision_open && test_ui.modal == BADGE_MODAL_NONE && !s_idle.asleep);
+        test_monotonic += 59999999;
+    } else if (step == 5) {
+        assert(!s_idle.asleep);
+        ++test_monotonic;
+    } else if (step == 6) assert(s_idle.asleep);
+}
+static void setup_stays_awake_until_actual_close(void)
+{
+    reset_fixture();
+    s_config.screen_timeout_min = 1;
+    choose_setting(3);
+    run_app(1, NULL);
+    process_network_commands();
+    run_app(6, setup_awake_hook);
+}
+
+static void reopened_setup_keeps_pending_fetch_and_retries_stop(void)
+{
+    reset_fixture();
+    test_ap_active = true;
+    choose_setting(4);
+    assert(s_manual_pending);
+    choose_setting(3);
+    run_app(1, NULL);
+    process_network_commands();
+    run_app(1, NULL);
+    assert(s_provision_open && s_manual_pending && !test_task_creates);
+    test_stop_failure = true;
+    press(BADGE_KEY_OK, false);
+    assert(s_provision_stop_pending && test_ap_active && s_manual_pending);
+    test_stop_failure = false; test_monotonic += 1000000;
+    run_app(1, NULL);
+    assert(!s_provision_stop_pending && test_stop_queued && !test_task_creates);
+    process_network_commands();
+    run_app(1, NULL);
+    assert(atomic_load(&s_syncing) && !s_manual_pending && !test_cancel_calls);
+    finish_worker();
+    run_app(1, NULL);
+}
+
+static void backup_close_hook(unsigned step)
+{
+    if (step == 1) {
+        on_key(BSP_BTN_UP, BSP_BTN_PRESS, NULL);
+    } else if (step == 2) {
+        /* The same app_task input state still holds UP when maintenance starts. */
+        atomic_store(&s_maintenance, true);
+        on_key(BSP_BTN_UP, BSP_BTN_RELEASE, NULL);
+        on_key(BSP_BTN_OK, BSP_BTN_PRESS, NULL);
+        test_monotonic += 100000;
+        on_key(BSP_BTN_OK, BSP_BTN_RELEASE, NULL);
+    } else if (step == 3) {
+        assert(!s_provision_open && test_ui.modal == BADGE_MODAL_NONE);
+        assert(test_stop_queued && atomic_load(&s_maintenance));
+        assert(!test_cancel_calls);
+    }
+}
+static void setup_can_close_during_backup(void)
+{
+    reset_fixture();
+    choose_setting(3);
+    run_app(1, NULL);
+    process_network_commands();
+    run_app(3, backup_close_hook);
+    backup_end(false);
+    process_network_commands();
+    run_app(1, NULL);
 }
 
 static void idle_hook(unsigned step)
@@ -708,6 +839,10 @@ int main(void)
     queued_fetch_survives_settings_exit();
     config_update_keeps_local_preferences();
     fetch_waits_for_queued_ap_commands();
+    setup_close_preserves_submission_and_failed_save();
+    setup_stays_awake_until_actual_close();
+    reopened_setup_keeps_pending_fetch_and_retries_stop();
+    setup_can_close_during_backup();
     screen_off_preserves_fetch_and_consumes_wake();
     screen_power_retries_partial_failures();
     failed_wake_consumes_further_gestures();
