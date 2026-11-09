@@ -778,13 +778,17 @@ static void completion_waits_for_final_mailbox(void)
     run_app(1, NULL);
     assert(s_mail_ready && atomic_load(&s_result_ready) && !s_data.last_success);
     assert(!strstr(test_notification, "FETCH OK"));
+    /* Request setup through the UI so the dialog is open before queuing AP
+     * startup. Inject lock failure afterwards to delay the final mailbox. */
+    choose_setting(3);
+    assert(s_provision_open && s_provision_pending && test_ui.modal == BADGE_MODAL_WIFI);
     test_fail_next_lvgl_lock = true;
-    s_provision_pending = true;
     run_app(1, NULL);
     assert(s_mail_ready && atomic_load(&s_result_ready) && !test_ap_starts);
     run_app(1, NULL);
     assert(!s_mail_ready && !atomic_load(&s_result_ready) && s_data.last_success == test_epoch);
-    assert(test_ap_starts == 1 && strstr(test_notification, "FETCH OK"));
+    assert(test_ap_starts == 1);
+    assert(strstr(test_notification, "FETCH OK"));
     reset_fixture();
     start_sync(true);
     finish_worker();
