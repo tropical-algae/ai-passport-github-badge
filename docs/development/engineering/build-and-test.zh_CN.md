@@ -140,6 +140,22 @@ cc -std=c11 -Wall -Wextra -Werror -Imain \
 
 完整验证要求预先激活 ESP-IDF 5.5.3。CI 与本地使用同一脚本；若 CI 和本地行为不同，应先修复脚本或环境，而不是维护两份命令。
 
+推送前还须使用 GNU GCC 检查原生 UI，与 Linux 发布 runner 的编译器类型
+一致。macOS 的 `/usr/bin/cc` 是 Clang，可能放过 GCC 在 `-Werror` 下拒绝
+的代码，例如字符串格式化截断警告：
+
+```bash
+./tools/check_ui_gcc.sh                         # PATH 中的真实 gcc
+BADGE_GCC=/opt/homebrew/bin/gcc-13 ./tools/check_ui_gcc.sh # macOS 示例
+```
+
+脚本会拒绝指向 Clang 的别名，并使用全新的 CMake 目录，避免缓存的编译器
+覆盖 `CC`。它运行与发布 CI 相同的原生 LVGL 渲染检查，完成后删除临时产物。
+所需环境为 CMake、Ninja、安装了 Pillow 的 Python，以及已解析到
+`managed_components/` 的锁定依赖。它不会构建 ESP32 固件、烧录设备或修改
+版本号。用户明确排除固件构建时，运行静态门禁和原生 GCC 检查，将固件门禁
+标为 NOT RUN；这两项检查都不代表真机验证通过，也不能替代完整发布构建。
+
 涉及物理外设的改动必须在真机运行硬件指南验收清单，并把“编译通过”与“硬件验证通过”分开记录。
 
 本铭牌发布同时提供 `0x10000` 的 app 升级镜像和 `0x0` 的完整镜像；app 文件需要已有兼容分区布局。具体规则见[手动发布指南](../ci/CI-build-and-release.zh_CN.md)。

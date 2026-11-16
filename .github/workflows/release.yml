@@ -78,6 +78,7 @@ jobs:
             -e CCACHE_DIR=/app/${{ github.repository }}/.ccache
             -e IDF_CCACHE_ENABLE=1
           command: |
+            set -eu
             command -v cmake
             command -v ninja
             ./tools/validate.sh --firmware

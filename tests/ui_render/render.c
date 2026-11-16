@@ -318,6 +318,13 @@ static void reference_fit(char out[196],const char *value,int width,const lv_fon
     if(shortened)memcpy(out+length,"...",4);
 }
 
+static void copy_fitted_reference(char *destination,size_t capacity,const char *expected) {
+    size_t length=strlen(expected);
+    /* The oracle must fit intact: truncating it would weaken the pixel check. */
+    assert(length<capacity);
+    memcpy(destination,expected,length+1);
+}
+
 static void assert_linear_text_fitting(void) {
     badge_data_t original=data;
     const char *examples[]={
@@ -333,7 +340,7 @@ static void assert_linear_text_fitting(void) {
         reference_fit(expected,data.blog,151,&badge_font_8);
         badge_ui_update(&data,&config,&status);lv_refr_now(display);
         uint32_t actual=area_hash(80,170,151,12);
-        snprintf(data.blog,sizeof(data.blog),"%s",expected);
+        copy_fitted_reference(data.blog,sizeof(data.blog),expected);
         badge_ui_update(&data,&config,&status);lv_refr_now(display);
         assert(area_hash(80,170,151,12)==actual);
 
@@ -341,7 +348,7 @@ static void assert_linear_text_fitting(void) {
         reference_fit(expected,data.name,222,&badge_font_10);
         badge_ui_update(&data,&config,&status);lv_refr_now(display);
         actual=area_hash(9,87,222,14);
-        snprintf(data.name,sizeof(data.name),"%s",expected);
+        copy_fitted_reference(data.name,sizeof(data.name),expected);
         badge_ui_update(&data,&config,&status);lv_refr_now(display);
         assert(area_hash(9,87,222,14)==actual);
     }
@@ -350,7 +357,7 @@ static void assert_linear_text_fitting(void) {
         char expected[196];reference_fit(expected,data.username,222,&badge_font_22);
         badge_ui_update(&data,&config,&status);lv_refr_now(display);
         uint32_t actual=area_hash(9,57,222,26);
-        snprintf(data.username,sizeof(data.username),"%s",expected);
+        copy_fitted_reference(data.username,sizeof(data.username),expected);
         badge_ui_update(&data,&config,&status);lv_refr_now(display);
         assert(area_hash(9,57,222,26)==actual);
     }

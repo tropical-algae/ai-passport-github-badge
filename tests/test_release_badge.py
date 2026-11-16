@@ -176,6 +176,56 @@ class ReleasePackageTest(unittest.TestCase):
             RELEASE.package(self.root, self.selected, self.root / 'corrupt')
 
 
+class BuildWorkflowTest(unittest.TestCase):
+    """Exercise the action's shell block without building or packaging firmware."""
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='badge-build-workflow-test-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        (self.root / 'tools').mkdir()
+        (self.root / 'bin').mkdir()
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        marker = '          command: |\n'
+        self.assertEqual(workflow.count(marker), 1)
+        lines = []
+        for line in workflow.split(marker, 1)[1].splitlines():
+            if line and not line.startswith('            '):
+                break
+            lines.append(line[12:])
+        self.script = '\n'.join(lines)
+        for name in ('cmake', 'ninja'):
+            tool = self.root / 'bin' / name
+            tool.write_text('#!/bin/sh\nexit 0\n')
+            tool.chmod(0o755)
+        validator = self.root / 'tools/validate.sh'
+        validator.write_text('#!/bin/sh\ntest "$1" = --firmware || exit 2\n'
+                             'exit "$TEST_VALIDATE_EXIT"\n')
+        validator.chmod(0o755)
+        (self.root / 'tools/release_badge.py').write_text(
+            'import pathlib, sys\n'
+            'assert sys.argv[1:] == ["package", "--plan", "build/release-plan.json", '
+            '"--output", "build/release-assets"]\n'
+            'pathlib.Path("packaged").touch()\n')
+
+    def run_build(self, validation_exit):
+        import os
+        env = dict(os.environ, PATH=str(self.root / 'bin') + os.pathsep + os.environ['PATH'],
+                   TEST_VALIDATE_EXIT=str(validation_exit))
+        # Do not inject -e here: the custom action command must set it itself.
+        return subprocess.run(['bash', '-c', self.script], cwd=self.root,
+                              env=env, capture_output=True, text=True)
+
+    def test_failed_validation_stops_before_packaging(self):
+        result = self.run_build(17)
+        self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertFalse((self.root / 'packaged').exists())
+
+    def test_successful_validation_reaches_packaging(self):
+        result = self.run_build(0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / 'packaged').exists())
+
+
 class PublishWorkflowTest(unittest.TestCase):
     """Execute the actual YAML shell block with a local gh simulator, no service writes."""
     def setUp(self):
@@ -255,5 +305,6 @@ path.write_text(json.dumps(state))
 if __name__ == '__main__':
     # Imported fixture class is a helper, not a second run of archive tests.
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls)
-                               for cls in (ReleasePlanningTest, ReleasePackageTest, PublishWorkflowTest))
+                               for cls in (ReleasePlanningTest, ReleasePackageTest,
+                                           BuildWorkflowTest, PublishWorkflowTest))
     unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() or sys.exit(1)

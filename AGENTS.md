@@ -75,6 +75,15 @@ Run the smallest relevant check while iterating, then run the complete gate befo
 ./tools/validate.sh             # complete gate
 ```
 
+Before pushing, run the static gate and `./tools/check_ui_gcc.sh` with a real
+GNU GCC host compiler; set `BADGE_GCC` to its executable when necessary.
+Clang-only checks do not cover the release runner's GCC warnings. The GCC check
+uses a fresh native LVGL build directory and requires the pinned Managed
+Components, CMake, Ninja, and Pillow. See the
+[build and test guide](docs/development/engineering/build-and-test.md).
+Honor an explicit request not to build firmware; report that part as NOT RUN
+instead of treating host checks as a complete release build.
+
 The complete gate requires an activated ESP-IDF 5.5.3 environment. Do not describe a successful build as hardware validation. Final delivery must report these fields separately:
 
 ```text

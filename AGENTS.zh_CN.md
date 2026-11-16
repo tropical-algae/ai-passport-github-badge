@@ -70,6 +70,14 @@
 ./tools/validate.sh             # 完整门禁
 ```
 
+推送前必须运行静态门禁，并用真正的 GNU GCC 主机编译器运行
+`./tools/check_ui_gcc.sh`；必要时通过 `BADGE_GCC` 指定编译器路径。
+仅通过 Clang 检查不能覆盖发布 runner 的 GCC 警告。此检查使用全新的
+原生 LVGL 构建目录，依赖锁定的 Managed Components、CMake、Ninja 和
+Pillow，详见[构建与验证指南](docs/development/engineering/build-and-test.zh_CN.md)。
+用户明确要求不构建固件时遵从该要求，将固件构建标为 NOT RUN，不把主机
+检查描述为完整发布构建通过。
+
 完整门禁要求已激活 ESP-IDF 5.5.3 环境。不得把编译成功描述成硬件验证成功。最终交付必须分别报告：
 
 ```text

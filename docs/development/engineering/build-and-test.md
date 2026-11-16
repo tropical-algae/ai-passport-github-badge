@@ -164,6 +164,24 @@ Use the unified validation entry point:
 
 CI calls the same script. Fix the shared script or environment if local and CI behavior differs; do not duplicate command sequences in workflows.
 
+Before pushing, also check the native UI with GNU GCC, as used by the Linux
+release runner. macOS `/usr/bin/cc` is Clang and can accept code that GCC rejects
+under `-Werror`, including format-truncation warnings:
+
+```bash
+./tools/check_ui_gcc.sh                         # real gcc on PATH
+BADGE_GCC=/opt/homebrew/bin/gcc-13 ./tools/check_ui_gcc.sh # macOS example
+```
+
+The script rejects Clang aliases and creates a fresh CMake directory so a cached
+compiler cannot silently override `CC`. It runs the same native LVGL rendering
+checks as release CI, then removes its temporary outputs. It requires CMake,
+Ninja, Python with Pillow, and the pinned components already resolved in
+`managed_components/`. It does not build ESP32 firmware, flash a device, or
+change a version. If firmware builds are explicitly excluded, run the static
+and native GCC checks and report the firmware gate as NOT RUN; neither check
+establishes hardware behavior or replaces the complete release build.
+
 Hardware-affecting changes must also run the applicable on-device checklist in the hardware guide. Report compilation separately from physical-device validation.
 
 The badge release ships both app-only updates at `0x10000` and a verified full image at `0x0`; the app-only file requires the existing compatible badge partition layout. See the [manual release guide](../ci/CI-build-and-release.md).
