@@ -56,18 +56,38 @@ and [LEDC clock and stop APIs](https://docs.espressif.com/projects/esp-idf/en/v5
 The isolated validation/release builds use these defaults; an existing local
 sdkconfig must also enable `CONFIG_PM_ENABLE` and `CONFIG_PM_DFS_INIT_AUTO`.
 
-After the first screen sleep, a continuous monotonic-clock callback replaces
-LVGL's 5 ms periodic tick. Only display refresh is paused; other LVGL timers
+During display initialization, a continuous monotonic-clock callback replaces
+LVGL's 5 ms periodic tick. On screen sleep, only display refresh is paused; other LVGL timers
 retain real time. Disabling the whole timer handler is avoided because LVGL 9.5
 then returns a 1 ms wait to the port, causing frequent polling. Layout requests
 cannot resume a sleeping display, and rejected SPI submissions release LVGL's
 flush wait so a wake can report the error and retry.
+
+Clock, battery, connection indicators, retry text and notifications invalidate
+only their affected areas. Unchanged visible retry text does not request a
+redraw. Each DMA strip skips offscreen sections and draw tasks; UTF-8 ellipsis
+fitting measures glyph prefixes in one pass. Page/data/theme changes still
+redraw the whole view. Native pixel comparisons cover partial updates against
+full redraws, including CJK glyphs and notification removal.
+
+The shared ADC keypad samples every 10 ms (100 Hz), with two consecutive samples
+for debounce. The badge subscribes only to press/release edges and retains its
+own 600 ms hold and wake-gesture handling. Existing local `sdkconfig` files need
+`CONFIG_BUTTON_PERIOD_TIME_MS=10` and `CONFIG_BUTTON_DEBOUNCE_TICKS=2`; isolated
+validation/release builds use these defaults. Sampling-phase tests cover taps,
+holds and wake consumption; analog noise and button feel need device checks.
 
 The application waits up to 250 ms between idle checks while asleep; a key
 interrupts that wait immediately. Ordinary network idle waits are up to one
 second, shortened for connection deadlines. Setup, scans and backup operations
 retain 100 ms checks, and queued network events wake the worker immediately.
 No input wait holds the backup maintenance lock.
+
+Background Wi-Fi failures share one reconnect backoff, increasing from one
+second to at most five minutes, including connection API failures and IP
+timeouts. Duplicate failure events preserve an already scheduled retry.
+Opening setup or submitting credentials resets the wait; during setup the
+retry delay is capped at five seconds. Receiving an IP resets the failure count.
 
 Screen-off keeps Wi-Fi, button detection and scheduled synchronization active;
 it does not enter CPU light or deep sleep. Wi-Fi uses IDF's default minimum
@@ -91,6 +111,10 @@ The setup dialog suspends inactivity sleep; closing it starts a fresh timeout. D
 
 Opening CONNECT WI-FI during a fetch waits for that worker to finish. The dialog displays FETCH IN PROGRESS / SETUP AFTER FETCH. Closing it cancels only the pending hotspot request, or stops the current hotspot without cancelling an accepted submission. A username change invalidates the previous account's in-flight collection and loads the new account's independent cache, or an empty view until its first fetch.
 
+The portal fetches network lists after an accepted scan, while scanning, and
+once for its final result. Ordinary status checks no longer download an
+unchanged list. Failed result reads retry, and simultaneous reads are coalesced.
+
 The portal footer reads `powered by TROPICALALGAE's codex`; only the name links to [TROPICALALGAE](https://github.com/tropical-algae), opening with `noopener noreferrer` in a new tab.
 
 ## Background collection and feedback
@@ -98,6 +122,14 @@ The portal footer reads `powered by TROPICALALGAE's codex`; only the name links 
 A triggered sync belongs to the background worker. Leaving settings, switching pages, changing appearance or turning the screen off does not cancel it. Valid network time is required before HTTPS. A fresh cached account does not refetch merely because the device rebooted; an overdue offline refresh runs after reconnection, subject to quota deadlines.
 
 The collector requests the sections needed by the seven pages and persists checkpoints. Independent sections continue when another endpoint fails, and completed cached sections remain visible until replacements are ready. Profile data is followed by the avatar download; image URLs are never fetched by rendering. A checkpoint advances only after its snapshot is durably saved. Retrying an incomplete collection resumes failed or unfinished work rather than discarding completed sections.
+
+Within a collection, consecutive requests to the same origin reuse one HTTP
+client after a complete, valid response. Errors, cancellation, server-requested
+closure and origin changes discard it. A stale reused connection gets at most
+one fresh connection attempt before any response is accepted. Snapshot
+publication releases TLS first to preserve its existing memory budget. Completed
+request checkpoints remain durable; advancing to the next repository page is
+folded into that page's request rather than writing a separate cursor.
 
 REFETCH DATA shows start and completion feedback, distinguishing full success, partial public data, transport/TLS/HTTP errors, clock wait, quota wait and storage failure. Two-line feedback includes the endpoint/reason when available; quota countdowns update with time. Manual refetch can retry ordinary network failures immediately. Actual server-imposed core, search and avatar deadlines remain persistent and cannot be bypassed by rebooting or starting a new collection.
 
@@ -142,6 +174,10 @@ The shared avatar gate validates the complete PNG IHDR, permitted color/bit-dept
 | `badge_data` | `0x700000` | `0x100000` | SPIFFS snapshots, avatars, event journal and sync cursors |
 
 Snapshots use two slots with schema, account identity, generation and CRC checks. Staged file replacements retain recoverable backups; interrupted writes are recovered at boot. The newest valid slot is preferred without treating an I/O error as proof that a newer record is absent. SPIFFS existence probes use supported VFS operations. An existing nonempty partition that cannot mount is preserved; only an entirely erased badge-data partition is automatically formatted. Full storage reports failure and keeps older valid records. There is no automatic old-account-cache eviction.
+
+Saving a snapshot identical to the newest valid slot skips the redundant write
+after validating both slots. A match with only the older slot still writes a
+new generation; an I/O error still fails the operation.
 
 EXPORT BACKUP and RESTORE BACKUP are separate from the ordinary setup form. Export includes the **saved** configuration, latest current-account model, avatar, accumulated activity and event deduplication IDs. It excludes unsaved form edits, other accounts and unfinished sync cursors. The Wi-Fi password is plaintext in the backup, which must be stored privately.
 
