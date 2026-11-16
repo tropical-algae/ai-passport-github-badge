@@ -1010,6 +1010,12 @@ static bool run_stage(sync_t *s)
         progress(s, "REPOSITORIES / LANGUAGES"); break;
     }
     case ST_REPOS:
+        /* Advancing an exhausted page has no result to protect on its own.
+         * Fold it into the next request; a failed request reloads the durable
+         * previous page's end and advances again without repeating languages. */
+        if (j->page_loaded && j->entry == j->page_count && !j->page_last) {
+            ++j->page; j->page_loaded = false;
+        }
         if (!j->page_loaded) {
             j->page_count = 0; j->entry = 0; j->page_repo_count = 0;
             snprintf(path, sizeof(path), "/users/%s/repos?type=owner&sort=full_name&direction=asc&per_page=%d&page=%" PRIu32,
@@ -1056,7 +1062,7 @@ static bool run_stage(sync_t *s)
             publish_repos(s, true); ++j->stage; j->watcher_index = 0;
             j->done &= ~(1U << ST_WATCHERS);
             progress(s, "REPOSITORIES CACHED / WATCHERS");
-        } else { ++j->page; j->page_loaded = false; }
+        }
         break;
     case ST_WATCHERS:
         /* The journal can be newer than the last displayed snapshot after
@@ -1105,7 +1111,7 @@ static unsigned next_stage(const sync_job_t *j, uint32_t attempted)
 static bool stage_needs_http(const sync_job_t *j, unsigned stage)
 {
     if (stage == ST_WATCHERS) return j->watcher_index < j->top_count && j->watcher_index < 3;
-    if (stage == ST_REPOS) return !j->page_loaded || j->entry < j->page_count;
+    if (stage == ST_REPOS) return !j->page_loaded || j->entry < j->page_count || !j->page_last;
     if (stage == ST_SEARCH) return (j->search_done & 15U) != 15U;
     if (stage == ST_ISSUES) return (j->search_done & 112U) != 112U;
     return true;

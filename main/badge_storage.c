@@ -293,12 +293,18 @@ bool badge_data_save_at(uint32_t space, const badge_data_t *data) {
     uint32_t ga = 0, gb = 0;
     bool io_error = false;
     bool oka = read_slot(a, data->username, old, &ga, &io_error);
+    bool same_a = oka && memcmp(old, data, sizeof(*data)) == 0;
     bool okb = read_slot(b, data->username, old, &gb, &io_error);
+    bool same_b = okb && memcmp(old, data, sizeof(*data)) == 0;
     free(old);
     /* A temporarily unreadable slot may be the newest valid snapshot. Do not
      * truncate it merely because its generation could not be inspected. */
     if (io_error) return false;
     bool a_latest = oka && (!okb || (int32_t)(ga - gb) >= 0);
+    // A terminal sync publication can repeat the last durable snapshot. Verify
+    // both slots first, then skip only an exact match with the newest valid
+    // record; matching an older slot must still create a newer generation.
+    if (a_latest ? same_a : same_b) return true;
     record_header_t h = { RECORD_MAGIC, BADGE_SCHEMA, sizeof(*data),
                          (a_latest ? ga : gb) + 1, crc32(data, sizeof(*data)) };
     /* Write the older slot directly; a power failure cannot invalidate the

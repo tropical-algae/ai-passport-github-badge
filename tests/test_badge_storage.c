@@ -22,6 +22,7 @@ static bool fail_sync, fail_commit;
 static unsigned rename_calls, fail_rename_mask;
 static esp_err_t mount_result = ESP_OK, nvs_result = ESP_OK;
 static unsigned format_calls;
+static unsigned snapshot_write_calls;
 static uint8_t flash[512];
 static badge_config_t committed_config, pending_config;
 static size_t committed_size;
@@ -96,6 +97,7 @@ static DIR *test_opendir(const char *path)
 
 static size_t test_fwrite(const void *data, size_t size, size_t count, FILE *file)
 {
+    ++snapshot_write_calls;
     size_t bytes = size * count;
     if (fail_write_budget != SIZE_MAX && bytes > fail_write_budget) {
         size_t written = fwrite(data, 1, fail_write_budget, file);
@@ -319,6 +321,9 @@ static void snapshot_tests(void)
     badge_data_reset(&data, "octocat"); data.followers = 1;
     assert(badge_data_save(&data));
     data.followers = 2; assert(badge_data_save(&data));
+    unsigned before = snapshot_write_calls;
+    assert(badge_data_save(&data));
+    assert(snapshot_write_calls == before); // Identical final publication: no Flash write.
     assert(badge_data_load("OCTOCAT", &loaded) && loaded.followers == 2);
     char a[64], b[64], long_name[] = "abcdefghijklmnopqrstuvwxyz1234567890123";
     assert(strlen(long_name) == 39);
@@ -334,6 +339,11 @@ static void snapshot_tests(void)
     assert(badge_data_load("octocat", &loaded) && loaded.followers == 2);
     FILE *file = test_fopen(b, "r+b"); assert(file);
     assert(fseek(file, sizeof(record_header_t) + 100, SEEK_SET) == 0); fputc(0xa5, file); fclose(file);
+    assert(badge_data_load("octocat", &loaded) && loaded.followers == 1);
+    data.followers = 3; assert(badge_data_save(&data));
+    before = snapshot_write_calls;
+    data.followers = 1; assert(badge_data_save(&data)); // Matches older a, not latest b.
+    assert(snapshot_write_calls > before);
     assert(badge_data_load("octocat", &loaded) && loaded.followers == 1);
     data.followers = 3; assert(badge_data_save(&data));
     fail_write_budget = sizeof(record_header_t) + 17;

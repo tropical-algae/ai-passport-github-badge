@@ -28,6 +28,7 @@ static unsigned repo_page_requests;
 static size_t gist_filler_size = 32 * 1024;
 static unsigned profiles, lang_a, lang_b, publications, watch_b, starred_requests;
 static unsigned avatar_requests, events_requests, search_requests, request_serial, avatar_serial, events_serial;
+static unsigned premature_page_writes;
 static const char *profile_name = "Alpha";
 static badge_data_t last_publication;
 static badge_data_t durable_publication;
@@ -163,10 +164,13 @@ bool esp_http_client_is_complete_data_received(esp_http_client_handle_t c)
 { return !c->truncated && c->position == c->length; }
 esp_err_t esp_http_client_cleanup(esp_http_client_handle_t c) { free(c); return ESP_OK; }
 
+static void observe_job_write(const void *data, size_t size);
+
 bool badge_cache_path(const char *username, const char *suffix, char *out, size_t size)
 { return snprintf(out, size, "%s/%s-%s", directory, username, suffix) < (int)size; }
 bool badge_file_write(const char *path, const void *data, size_t size)
 {
+    if (strstr(path, "-job")) observe_job_write(data, size);
     if (fail_write) return false;
     char temp[200]; snprintf(temp, sizeof(temp), "%s.tmp", path);
     FILE *file = fopen(temp, "wb"); assert(file);
@@ -196,6 +200,13 @@ typedef struct {
     badge_scope_t top_scopes[BADGE_REPOS];
     uint8_t top_count;
 } job_prefix_fixture_t;
+
+static void observe_job_write(const void *data, size_t size)
+{
+    assert(size >= sizeof(job_prefix_fixture_t));
+    job_prefix_fixture_t job; memcpy(&job, data, sizeof(job));
+    if (job.page > 1 && !job.page_loaded) ++premature_page_writes;
+}
 
 static void rewrite_job_fixture(const char *username, int damage)
 {
@@ -628,6 +639,7 @@ int main(void)
     assert(badge_sync_run_request(&config, &data, publish, NULL, true, &result) == ESP_OK);
     assert(repo_page_requests == 3 && profiles == profiles_before);
     assert(lang_a == a_before + 1 && lang_b == b_before + 1);
+    assert(!premature_page_writes); /* Page advance is durable with its response, not separately. */
     check_complete(&data);
 
     /* CRC-valid caches still require bounded strings, booleans and cursors.
