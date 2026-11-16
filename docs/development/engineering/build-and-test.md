@@ -192,6 +192,11 @@ wake flash, capture `Screen ... begin/complete` and failure logs while reproduci
 it on-device; report the theme, brightness and whether the backlight itself
 switches off. A passing native check alone does not close a device-only report.
 
+These wake cases include decoded avatars loaded from opaque PNG, JPEG and
+transparent PNG fixtures. A decoder probe detects attempts to run TJPGD's large
+info callback for cached pixel images; placeholder-only rendering and the host's
+larger stack would otherwise miss this embedded-stack regression.
+
 Hardware-affecting changes must also run the applicable on-device checklist in the hardware guide. Report compilation separately from physical-device validation.
 
 The badge release ships both app-only updates at `0x10000` and a verified full image at `0x0`; the app-only file requires the existing compatible badge partition layout. See the [manual release guide](../ci/CI-build-and-release.md).

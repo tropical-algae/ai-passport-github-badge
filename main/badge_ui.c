@@ -4,6 +4,7 @@
 #include "badge_sync_parse.h"
 #include "lvgl.h"
 #include "src/draw/lv_image_decoder_private.h"
+#include "src/libs/bin_decoder/lv_bin_decoder.h"
 #include "src/libs/qrcode/qrcodegen.h"
 #include "src/misc/cache/instance/lv_image_cache.h"
 #include "src/misc/lv_text_private.h"
@@ -56,6 +57,7 @@ static badge_status_t status;
 static lv_obj_t *screen, *qr;
 static lv_image_dsc_t avatar;
 static bool avatar_valid, qr_valid;
+static lv_image_decoder_t *bitmap_decoder;
 static char qr_content[192];
 static badge_modal_t qr_modal;
 static uint32_t toast_until;
@@ -69,6 +71,41 @@ static bool toast_error;
 enum { QR_VERSION=4, QR_MODULES=33, QR_SCALE=3, QR_QUIET_MODULES=4,
        QR_SIDE=QR_MODULES*QR_SCALE, QR_INSET=QR_QUIET_MODULES*QR_SCALE,
        QR_BOX_SIDE=QR_SIDE+2*QR_INSET, QR_BOX_TOP=79 };
+
+static lv_result_t bitmap_info(lv_image_decoder_t *decoder,
+                               lv_image_decoder_dsc_t *decoded, lv_image_header_t *header)
+{
+    if(decoded->src_type!=LV_IMAGE_SRC_VARIABLE || !decoded->src)return LV_RESULT_INVALID;
+    const lv_image_dsc_t *image=decoded->src;
+    if(image->header.magic!=LV_IMAGE_HEADER_MAGIC ||
+       (image->header.flags&LV_IMAGE_FLAGS_COMPRESSED))return LV_RESULT_INVALID;
+    switch(image->header.cf) {
+    case LV_COLOR_FORMAT_RGB565:
+    case LV_COLOR_FORMAT_RGB565A8:
+    case LV_COLOR_FORMAT_I1:
+        return lv_bin_decoder_info(decoder,decoded,header);
+    default:return LV_RESULT_INVALID;
+    }
+}
+
+static bool prepare_bitmap_decoder(void)
+{
+    if(bitmap_decoder)return true;
+    /* LVGL tries the newest decoder first. Its JPEG info probe reserves a
+     * 4272-byte frame on ESP32-C3 even when rejecting an already decoded
+     * bitmap. Synchronous wake redraw runs on the 6KiB application stack,
+     * so keep our RGB565 avatar and I1 QR on the lightweight binary path.
+     * Encoded PNG/JPEG input still goes through the original codecs. */
+    lv_image_decoder_t *decoder=lv_image_decoder_create();
+    if(!decoder)return false;
+    lv_image_decoder_set_info_cb(decoder,bitmap_info);
+    lv_image_decoder_set_open_cb(decoder,lv_bin_decoder_open);
+    lv_image_decoder_set_get_area_cb(decoder,lv_bin_decoder_get_area);
+    lv_image_decoder_set_close_cb(decoder,lv_bin_decoder_close);
+    decoder->name="BADGE BITMAP";
+    bitmap_decoder=decoder;
+    return true;
+}
 
 static const badge_theme_t *theme(void) { return &themes[config.theme < 5 ? config.theme : 0]; }
 static uint32_t mixed(uint32_t a, uint32_t b, unsigned percent)
@@ -769,6 +806,10 @@ static void update_qr(void)
         qr_valid=false;qr_modal=BADGE_MODAL_NONE;
         memset(qr_content,0,sizeof(qr_content));return;
     }
+    if(!prepare_bitmap_decoder()) {
+        if(qr)lv_obj_add_flag(qr,LV_OBJ_FLAG_HIDDEN);
+        qr_valid=false;return;
+    }
     if(!qr) {
         qr=lv_qrcode_create(screen);
         lv_qrcode_set_dark_color(qr,lv_color_black());lv_qrcode_set_light_color(qr,lv_color_white());
@@ -787,6 +828,7 @@ void badge_ui_init(const badge_data_t *new_data, const badge_config_t *new_confi
                    const badge_status_t *new_status)
 {
     memset(&state,0,sizeof(state));data=new_data;config=*new_config;status=*new_status;
+    prepare_bitmap_decoder();
     toast_text[0]=0;toast_detail=NULL;toast_error=false;toast_until=0;
     screen=lv_obj_create(NULL);lv_obj_remove_style_all(screen);
     lv_obj_set_size(screen,240,320);lv_obj_set_style_bg_opa(screen,LV_OPA_COVER,0);
@@ -958,6 +1000,7 @@ bool badge_ui_set_avatar(const void *bytes,size_t size)
     }
     unsigned width=0,height=0;
     if(!badge_avatar_dimensions(bytes,size,&width,&height))return false;
+    if(!prepare_bitmap_decoder())return false;
     /* TJPGD's file-info callback already uses a 4KiB stack frame. Keep our
      * descriptors/coverage on the heap, outside the 6KiB application stack. */
     avatar_decode_work_t *work=lv_malloc_zeroed(sizeof(*work));

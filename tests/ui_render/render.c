@@ -2,6 +2,7 @@
 #include "badge_ui_avatar.h"
 #include "bsp_display_rounding.h"
 #include "lvgl.h"
+#include "src/draw/lv_image_decoder_private.h"
 #include "src/libs/qrcode/qrcodegen.h"
 #include <assert.h>
 #include <stdio.h>
@@ -18,6 +19,47 @@ LV_FONT_DECLARE(badge_font_10);
 LV_FONT_DECLARE(badge_font_14);
 LV_FONT_DECLARE(badge_font_22);
 static unsigned char avatar_bytes[24576];
+static lv_image_decoder_info_f_t jpeg_info, png_info;
+static unsigned jpeg_probes, png_probes, bitmap_codec_probes, decoder_count_after_init;
+static void count_bitmap_codec_probe(const lv_image_decoder_dsc_t *decoded) {
+    if(decoded->src_type!=LV_IMAGE_SRC_VARIABLE)return;
+    const lv_image_dsc_t *image=decoded->src;
+    if(image->header.cf==LV_COLOR_FORMAT_RGB565 || image->header.cf==LV_COLOR_FORMAT_RGB565A8 ||
+       image->header.cf==LV_COLOR_FORMAT_I1)++bitmap_codec_probes;
+}
+static lv_result_t track_jpeg(lv_image_decoder_t *decoder,lv_image_decoder_dsc_t *decoded,
+                              lv_image_header_t *header) {
+    ++jpeg_probes;count_bitmap_codec_probe(decoded);
+    return jpeg_info(decoder,decoded,header);
+}
+static lv_result_t track_png(lv_image_decoder_t *decoder,lv_image_decoder_dsc_t *decoded,
+                             lv_image_header_t *header) {
+    ++png_probes;count_bitmap_codec_probe(decoded);
+    return png_info(decoder,decoded,header);
+}
+static unsigned decoder_count(void) {
+    unsigned count=0;
+    for(lv_image_decoder_t *decoder=lv_image_decoder_get_next(NULL);decoder;
+        decoder=lv_image_decoder_get_next(decoder))++count;
+    return count;
+}
+static void track_image_codecs(void) {
+    for(lv_image_decoder_t *decoder=lv_image_decoder_get_next(NULL);decoder;
+        decoder=lv_image_decoder_get_next(decoder)) {
+        if(decoder->name && !strcmp(decoder->name,"TJPGD")) {
+            jpeg_info=decoder->info_cb;lv_image_decoder_set_info_cb(decoder,track_jpeg);
+        } else if(decoder->name && !strcmp(decoder->name,"LODEPNG")) {
+            png_info=decoder->info_cb;lv_image_decoder_set_info_cb(decoder,track_png);
+        }
+    }
+    assert(jpeg_info && png_info);
+}
+static void assert_bitmap_decoder_path(void) {
+    /* Repeated frames, theme changes, and QR replacement must not enter the
+     * JPEG info callback's 4KiB stack frame or register more decoders. */
+    assert(bitmap_codec_probes==0);
+    assert(decoder_count()==decoder_count_after_init);
+}
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *pixels) {
     const uint16_t *p=(const uint16_t *)pixels;
     flushed_pixels+=(unsigned)(lv_area_get_width(a)*lv_area_get_height(a));
@@ -29,6 +71,7 @@ static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *pixels) {
 }
 static void save(const char *name) {
     lv_refr_now(display);
+    assert_bitmap_decoder_path();
     char filename[100];snprintf(filename,sizeof(filename),"%s.ppm",name);
     FILE *f=fopen(filename,"wb");assert(f);fprintf(f,"P6\n240 320\n255\n");
     for(unsigned i=0;i<240*320;i++) {
@@ -368,7 +411,9 @@ static void assert_linear_text_fitting(void) {
 int main(int argc,char **argv) {
     lv_init();display=lv_display_create(240,320);lv_display_set_color_format(display,LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(display,drawbuffer,NULL,sizeof(drawbuffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(display,flush);
+    track_image_codecs();
     fill_data();badge_ui_init(&data,&config,&status);
+    decoder_count_after_init=decoder_count();
     lv_font_glyph_dsc_t glyph;
     assert(lv_font_get_glyph_dsc(&badge_font_10,&glyph,0x4e2d,0));
     assert(lv_font_get_glyph_dsc(&badge_font_8,&glyph,0x6587,0));
@@ -379,10 +424,13 @@ int main(int argc,char **argv) {
     assert(avatar_file);
     if(avatar_file) {
         size_t size=fread(avatar_bytes,1,sizeof(avatar_bytes),avatar_file);fclose(avatar_file);
+        unsigned jpeg_before=jpeg_probes,png_before=png_probes;
         bool loaded=badge_ui_set_avatar(avatar_bytes,size);printf("avatar decoded: %s\n",loaded?"yes":"no");
         bool reject=argc>2 && !strcmp(argv[2],"reject");
         if(reject)assert(!loaded);else assert(loaded);
         if(loaded) {
+            if(avatar_bytes[0]==0xff)assert(jpeg_probes>jpeg_before);
+            else assert(png_probes>png_before);
             save("avatar-owned-pixels");uint32_t picture=frame_hash();
             if(argc>1 && strstr(argv[1],"/avatar64.jpg")) {
                 /* Valid JPEG without the optional JFIF APP0 header: GitHub's
@@ -431,6 +479,7 @@ int main(int argc,char **argv) {
         }
     }
     if(argc>3 && !strcmp(argv[3],"avatar-only")) {
+        assert_bitmap_decoder_path();
         puts("native avatar checks passed");
         return 0;
     }
@@ -675,5 +724,7 @@ int main(int argc,char **argv) {
     badge_ui_key(BADGE_KEY_DOWN,false);badge_ui_key(BADGE_KEY_OK,false);save("invalid-counts-issues");
     status.now=INT64_MAX;badge_ui_tick(&status);save("invalid-clock");
     puts("battery, language, notification, and provisioning render checks passed");
+    assert_bitmap_decoder_path();
+    puts("decoded avatar/QR skip image codecs; encoded PNG/JPEG still decode; decoder registration stays constant");
     puts("native LVGL render complete");return 0;
 }

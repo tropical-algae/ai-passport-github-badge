@@ -160,6 +160,16 @@ The encoded avatar is stored in Flash for offline use. The app reads and decodes
 
 A failed decode preserves an existing valid avatar and can be retried later; changing accounts clears the previous avatar. Rendering draws the owned pixels without downloading or repeatedly decoding the image. The opaque pixel buffer costs 5,832 bytes; optional alpha adds 2,916 bytes. Decode scratch state is heap allocated to protect the small application stack.
 
+The UI registers a lightweight decoder ahead of the compressed-image codecs for
+its RGB565/RGB565A8 avatar and I1 QR memory images, reusing LVGL's binary-decoder
+callbacks. Encoded PNG/JPEG sources still use their original codecs. This also
+avoids probing TJPGD during every bitmap redraw: its info callback reserves over
+4 KiB of stack before checking the source type. Synchronous wake rendering runs
+on the 6 KiB application task stack, where that unnecessary probe can overflow
+the stack and reboot the badge. The wake regression loads opaque PNG, JPEG and
+transparent PNG avatars and checks that bitmap rendering never enters TJPGD.
+
+
 LVGL shares the normal IDF heap instead of reserving an idle fixed pool. The BSP uses one 240 × 40 RGB565 DMA display buffer. Network, portal and avatar-decoding peaks are separated; no PSRAM is assumed. Successful native allocation tests cannot establish real-device heap/stack margins.
 
 The shared avatar gate validates the complete PNG IHDR, permitted color/bit-depth combinations, compression/filter methods and interlace mode before downloading to cache, accepting a backup, or invoking the UI decoder. The pinned LVGL 9.5.0 LodePNG adapter's `decodeGeneric()` allocates a four-byte-per-pixel buffer before `postProcessScanlines()` writes source-format pixels; RGB16/RGBA16 need six/eight bytes per pixel. Rejecting all 16-bit PNGs at the shared gate prevents that unsafe path without a vendor patch. Pixel-comparison fixtures cover accepted PNG formats; sanitizer regressions verify that 16-bit RGB/RGBA never reach the decoder.

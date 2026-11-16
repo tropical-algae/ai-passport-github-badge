@@ -2,10 +2,12 @@
  * time and physical panel are simulated. This checks transmitted pixels and
  * backlight ordering; it cannot model the LCD's analog scanout or PWM signal. */
 #include "badge_ui.h"
+#include "badge_ui_avatar.h"
 #include "bsp_display.h"
 #include "esp_lvgl_port.h"
 #include "freertos/task.h"
 #include "src/core/lv_obj_private.h"
+#include "src/draw/lv_image_decoder_private.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +28,21 @@ static int64_t now_us = 1000000;
 static const uint8_t *dma_pixels;
 static lv_area_t dma_area;
 static unsigned flushes, lit_flushes, wakes, visible_checks, light_on_calls;
+static unsigned jpeg_bitmap_probes;
+static lv_image_decoder_info_f_t jpeg_info;
+
+static lv_result_t count_jpeg_info(lv_image_decoder_t *decoder,
+                                  lv_image_decoder_dsc_t *dsc,
+                                  lv_image_header_t *header)
+{
+    if (dsc->src_type == LV_IMAGE_SRC_VARIABLE) {
+        const lv_image_dsc_t *source = dsc->src;
+        if (source->header.cf == LV_COLOR_FORMAT_RGB565 ||
+            source->header.cf == LV_COLOR_FORMAT_RGB565A8 ||
+            source->header.cf == LV_COLOR_FORMAT_I1) ++jpeg_bitmap_probes;
+    }
+    return jpeg_info(decoder, dsc, header);
+}
 
 static void check_visible(void)
 {
@@ -69,6 +86,15 @@ esp_err_t lvgl_port_init(const lvgl_port_cfg_t *cfg)
 {
     (void)cfg;
     lv_init();
+    for (lv_image_decoder_t *decoder = lv_image_decoder_get_next(NULL); decoder;
+         decoder = lv_image_decoder_get_next(decoder)) {
+        if (decoder->name && !strcmp(decoder->name, "TJPGD")) {
+            jpeg_info = decoder->info_cb;
+            lv_image_decoder_set_info_cb(decoder, count_jpeg_info);
+            break;
+        }
+    }
+    assert(jpeg_info);
     tick_active = true;
     return ESP_OK;
 }
@@ -165,6 +191,7 @@ static void sleep_wake(void)
     refresh();
     memcpy(expected, framebuffer, sizeof(expected));
     unsigned before = flushes, light_on_before = light_on_calls;
+    unsigned jpeg_probes_before = jpeg_bitmap_probes;
     assert(bsp_lvgl_sleep() == ESP_OK);
     assert(!brightness && sleeping);
     now_us += 60000000;
@@ -176,6 +203,9 @@ static void sleep_wake(void)
     assert(flushes == before);
     check_wake_frame = true;
     assert(bsp_lvgl_wake(config.brightness) == ESP_OK);
+    /* A host stack has ample room, but the firmware's app task does not:
+     * TJPGD info reserves 4272 bytes even when rejecting a decoded bitmap. */
+    assert(jpeg_bitmap_probes == jpeg_probes_before);
     assert(brightness == config.brightness && !check_wake_frame);
     /* A late animation/dirty-layout refresh would run after brightness returns.
      * Check its every DMA strip too, including the first subsequent timer run. */
@@ -217,7 +247,7 @@ static void select_theme(unsigned theme)
 
 int main(int argc, char **argv)
 {
-    assert(argc == 2);
+    assert(argc == 3);
     unsigned startup_theme = (unsigned)strtoul(argv[1], NULL, 10);
     assert(startup_theme < 5);
     badge_config_defaults(&config);
@@ -234,6 +264,16 @@ int main(int argc, char **argv)
     assert(initialized && initialized == display);
     assert(bsp_lvgl_lock(1000));
     badge_ui_init(&data, &config, &status);
+    FILE *file = fopen(argv[2], "rb");
+    assert(file);
+    uint8_t *encoded = malloc(24577);
+    assert(encoded);
+    size_t length = fread(encoded, 1, 24577, file);
+    assert(!ferror(file) && length > 0 && length <= 24576);
+    fclose(file);
+    assert(badge_ui_set_avatar(encoded, length));
+    free(encoded);
+    data.valid |= BADGE_AVATAR;
     refresh();
     assert(bsp_display_set_backlight(config.brightness) == ESP_OK);
     sleep_wake(); /* Startup from restored theme, with no interactive selection. */
