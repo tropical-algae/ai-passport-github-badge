@@ -38,6 +38,8 @@ GitHub Pixel Passport 是为 FoloToy AI Passport 打造的七页、240 × 320 Gi
 
 ## 显示省电与空闲任务
 
+唤醒时，背光在 LCD 退出休眠、完整重绘及 SPI DMA 传输期间保持关闭，传输完成后再让出 CPU 等待至少 50 毫秒，最后恢复亮度。面板扫描独立于 SPI 传输，本板没有连接 TE 或回读信号。这段有限等待为扫描边界、当前标称 60 Hz 下的完整扫描和画面稳定留出余量，与控制器要求的 SLPOUT 至 SLPIN 之间 120 毫秒保护间隔分开处理。唤醒失败时暂停刷新，重试时重新绘制并等待；对已经唤醒的显示重复调用不会黑屏或再次等待。主机测试验证此顺序和故障处理，实际视觉效果仍需实机验证。
+
 默认配置启用 ESP-IDF 动态调频：CPU 空闲时可降至 40 MHz 晶振频率，处理任务时使用 160 MHz。
 背光改用晶振时钟，避免 APB 频率变化影响 PWM。依据官方[电源管理说明](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32c3/api-reference/system/power_management.html)
 及 [LEDC 时钟与停止接口](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32c3/api-reference/peripherals/ledc.html)。

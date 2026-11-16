@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <stddef.h>
 #include <stdio.h>
+#include "freertos/task.h"
 #include "../components/bsp/src/bsp_display_lvgl.c"
 
 static lv_display_t display;
@@ -17,10 +18,12 @@ static int invalidation_count = 1;
 static lv_timer_t refresh_timer;
 static uint32_t (*tick_callback)(void);
 static int64_t monotonic_us = 5000000;
+static int64_t scan_ready_us;
+static unsigned scan_waits;
 static void (*flush_callback)(lv_display_t *, const lv_area_t *, uint8_t *);
 static unsigned fail_draw, draw_calls, flush_ready_calls;
 static unsigned brightness;
-static unsigned fail_stop, fail_resume, fail_panel, fail_drain, fail_light;
+static unsigned fail_stop, fail_resume, fail_panel, fail_drain, fail_light, fail_restore;
 static char power_trace[128];
 static size_t power_trace_size;
 static void trace(char event) {
@@ -98,7 +101,13 @@ esp_err_t lvgl_port_resume(void) {
 esp_err_t bsp_display_set_backlight(uint8_t value) {
     trace(value ? '6' : '0');
     if (fail_light) { --fail_light; return ESP_FAIL; }
-    if (value) assert(!dma_pending);
+    if (value) {
+        assert(!dma_pending);
+        // A completed SPI upload is not a completed LCD scan. Model the
+        // worst scan phase plus one complete 60 Hz frame separately.
+        assert(monotonic_us >= scan_ready_us);
+        if (fail_restore) { --fail_restore; return ESP_FAIL; }
+    }
     brightness = value;
     return ESP_OK;
 }
@@ -160,7 +169,15 @@ esp_err_t esp_lcd_panel_io_tx_param(esp_lcd_panel_io_handle_t io, int command,
     trace('D');
     if (fail_drain) { --fail_drain; return ESP_FAIL; }
     if (dma_pending) lv_display_flush_ready(&display); // Existing port DMA callback.
+    if (dma_pending) scan_ready_us = monotonic_us + 34000;
     dma_pending = false; return ESP_OK;
+}
+void vTaskDelay(TickType_t ticks) {
+    trace('W');
+    assert(!brightness && !lcd_asleep && !dma_pending && !s_flush_error);
+    assert(ticks >= 50 && ticks <= 70); // A bounded, yielding scanout guard.
+    monotonic_us += (int64_t)ticks * 1000;
+    ++scan_waits;
 }
 static void reset_power(void) {
     assert(!lock_depth);
@@ -168,11 +185,12 @@ static void reset_power(void) {
     timer_enabled = tick_active = true; lcd_asleep = dma_pending = false;
     s_monotonic_tick = s_refresh_paused = false; s_tick_offset = 0; s_flush_error = ESP_OK;
     tick_callback = NULL; monotonic_us = 5000000;
+    scan_ready_us = 0; scan_waits = 0;
     invalidation_enabled = true; invalidation_count = 1; refresh_timer.paused = false;
     fail_draw = draw_calls = flush_ready_calls = 0;
     port_refresh_requests = 0;
     brightness = 60;
-    fail_stop = fail_resume = fail_panel = fail_drain = fail_light = 0;
+    fail_stop = fail_resume = fail_panel = fail_drain = fail_light = fail_restore = 0;
     power_trace_size = 0; power_trace[0] = 0;
 }
 static esp_err_t sleep_display(void) {
@@ -191,10 +209,12 @@ static void power_transitions(void) {
     monotonic_us += 60000000;
     assert(lv_tick_get() == 61234); // Other LVGL timers continue to observe real time.
     assert(sleep_display() == ESP_OK && !strcmp(power_trace, "0SI"));
-    assert(wake_display() == ESP_OK && !strcmp(power_trace, "0SI0OVFD6"));
+    assert(wake_display() == ESP_OK && !strcmp(power_trace, "0SI0OVFDW6"));
     assert(!s_suspended && !lcd_asleep && !dma_pending && brightness == 60);
     assert(!tick_active && timer_enabled && !refresh_timer.paused && invalidation_enabled);
-    assert(wake_display() == ESP_OK && !strcmp(power_trace, "0SI0OVFD66"));
+    assert(scan_waits == 1);
+    assert(wake_display() == ESP_OK && !strcmp(power_trace, "0SI0OVFDW66"));
+    assert(scan_waits == 1); // Already awake: no dark interval or extra delay.
 
     reset_power(); fail_stop = 1;
     assert(sleep_display() == ESP_FAIL);
@@ -216,10 +236,13 @@ static void power_transitions(void) {
     assert(sleep_display() == ESP_OK);
     fail_panel = 1;
     assert(wake_display() == ESP_FAIL && !lcd_asleep && !s_lcd_sleeping);
+    assert(!scan_waits);
     assert(sleep_display() == ESP_OK && lcd_asleep); // Partial wake must re-sleep.
     fail_drain = 1;
     assert(wake_display() == ESP_FAIL && !brightness && dma_pending && s_suspended);
+    assert(!scan_waits && refresh_timer.paused && !invalidation_enabled);
     assert(wake_display() == ESP_OK && !dma_pending && brightness == 60);
+    assert(scan_waits == 1);
 
     reset_power(); fail_panel = 1;
     assert(sleep_display() == ESP_FAIL && !s_lcd_sleeping);
@@ -228,7 +251,17 @@ static void power_transitions(void) {
     reset_power(); assert(sleep_display() == ESP_OK); fail_draw = 1;
     assert(wake_display() == ESP_FAIL && !brightness && s_suspended);
     assert(draw_calls == 1 && flush_ready_calls == 1 && refresh_timer.paused && !invalidation_enabled);
+    assert(!scan_waits);
     assert(wake_display() == ESP_OK && brightness == 60 && draw_calls == 2);
+    assert(scan_waits == 1);
+
+    reset_power(); assert(sleep_display() == ESP_OK);
+    // Resume fails specifically when restoring nonzero brightness. A later
+    // retry must redraw and wait for its own new frame before trying again.
+    fail_restore = 1;
+    assert(wake_display() == ESP_FAIL && !brightness && scan_waits == 1);
+    assert(s_suspended && refresh_timer.paused && !invalidation_enabled);
+    assert(wake_display() == ESP_OK && scan_waits == 2 && brightness == 60);
 }
 static void dirty_layout_cannot_restart_sleeping_display(void) {
     reset_power(); assert(sleep_display() == ESP_OK);

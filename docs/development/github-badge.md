@@ -38,6 +38,16 @@ Inactivity is measured from the last button activity. Screen timeout stops the b
 
 ## Display power and idle work
 
+Wake keeps the backlight off through LCD wake-up, the full redraw and SPI DMA
+completion, then yields for at least 50 ms before restoring brightness. The
+panel scans independently of SPI transfers, and this board has no TE/readback
+signal. This bounded margin allows for a scan boundary, a complete scan at the
+configured nominal 60 Hz, and settling; it is separate from the controller's
+120 ms SLPOUT-to-SLPIN guard. Failed wake attempts keep refresh paused and retry
+with a fresh redraw and settling interval. Calling wake on an already awake
+display does not blank it or add this delay. Host tests verify this ordering
+and failure handling; optical behavior still requires on-device verification.
+
 The default configuration enables ESP-IDF dynamic frequency scaling: the CPU
 can fall to the 40 MHz crystal frequency while idle and run at 160 MHz for work.
 The backlight uses the crystal clock so PWM stays stable as APB frequency changes.

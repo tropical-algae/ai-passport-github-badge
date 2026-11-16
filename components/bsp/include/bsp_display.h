@@ -61,9 +61,10 @@ void bsp_lvgl_unlock(void);
 // callback/ISR. Sleep pauses this display's refresh timer/invalidation, stops
 // PWM/LCD scanning, and permanently replaces the periodic LVGL tick with a
 // continuous monotonic callback. Other LVGL timers keep running normally.
-// Wake restores LCD/refresh/invalidation and a full frame, drains SPI DMA, then
-// restores brightness. The BSP fixes RGB565 portrait rendering, no SW rotation.
-// Each can block for ~120 ms plus rendering/SPI completion. Repeated success is
+// Wake restores LCD/refresh/invalidation and a full frame, drains SPI DMA, waits
+// 50 ms for panel scanout/settling, then restores brightness. RGB565 portrait,
+// no SW rotation. Sleep blocks ~100 ms; wake ~170 ms plus RTOS tick rounding
+// and rendering/SPI completion. Repeated success is
 // harmless; on error keep UI input blocked and retry at a bounded rate. Internal
 // state preserves partial transitions; neither API deinitializes the LVGL port.
 esp_err_t bsp_lvgl_sleep(void);

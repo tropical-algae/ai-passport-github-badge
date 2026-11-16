@@ -8,11 +8,16 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "freertos/task.h"
 #include <string.h>
 
 static const char *TAG = "bsp_lvgl";
 
 #define BSP_LVGL_DRAW_BUFFER_LINES 40
+// This board has no TE/readback signal. At its nominal 60 Hz, leave room for
+// the next scan boundary, a full scan, and settling after the final GRAM write.
+// This is a BSP margin, not the controller's separate SLPOUT timing requirement.
+#define BSP_LVGL_WAKE_SETTLE_MS 50
 
 static lv_display_t *s_disp;
 static bool s_port_initialized;
@@ -266,7 +271,13 @@ esp_err_t bsp_lvgl_wake(uint8_t brightness) {
     // final asynchronous flush may still be in flight after lv_refr_now.
     e = esp_lcd_panel_io_tx_param(bsp_display_io(), -1, NULL, 0);
     if (s_flush_error != ESP_OK) e = s_flush_error;
-    if (e == ESP_OK) e = bsp_display_set_backlight(brightness);
+    if (e == ESP_OK) {
+        // DMA completion means GRAM is written, not that the panel has shown
+        // that frame. Keep the first scan hidden; yield instead of busy-waiting.
+        // Two extra ticks cover conversion and initial tick-boundary rounding.
+        vTaskDelay(pdMS_TO_TICKS(BSP_LVGL_WAKE_SETTLE_MS) + 2);
+        e = bsp_display_set_backlight(brightness);
+    }
     if (e == ESP_OK) s_suspended = false;
     else pause_refresh();
     return e;
