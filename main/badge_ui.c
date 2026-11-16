@@ -61,18 +61,13 @@ static uint32_t toast_until;
 static char toast_text[128];
 static const char *toast_detail;
 static bool toast_error;
-enum { WIFI_QR_BOX_SIDE=123, WIFI_QR_BOX_TOP=79,
-       PROFILE_QR_BOX_SIDE=140, PROFILE_QR_BOX_TOP=81, QR_QUIET_MODULES=4 };
-
-static int qr_box_side(void)
-{
-    return state.modal==BADGE_MODAL_PROFILE?PROFILE_QR_BOX_SIDE:WIFI_QR_BOX_SIDE;
-}
-
-static int qr_box_top(void)
-{
-    return state.modal==BADGE_MODAL_PROFILE?PROFILE_QR_BOX_TOP:WIFI_QR_BOX_TOP;
-}
+/* Version 4 holds both the generated Wi-Fi credentials and the longest
+ * supported GitHub profile URL (19 + 39 bytes) at medium error correction.
+ * Keep the same 33 modules, three pixels/module, and four-module quiet zone
+ * for both dialogs instead of shrinking shorter profile URLs. */
+enum { QR_VERSION=4, QR_MODULES=33, QR_SCALE=3, QR_QUIET_MODULES=4,
+       QR_SIDE=QR_MODULES*QR_SCALE, QR_INSET=QR_QUIET_MODULES*QR_SCALE,
+       QR_BOX_SIDE=QR_SIDE+2*QR_INSET, QR_BOX_TOP=79 };
 
 static const badge_theme_t *theme(void) { return &themes[config.theme < 5 ? config.theme : 0]; }
 static uint32_t mixed(uint32_t a, uint32_t b, unsigned percent)
@@ -644,8 +639,7 @@ static void modal(lv_layer_t *l)
         CENTER(l,19,245,202,"192.168.4.1",&badge_font_8,t->accent);
     }
     if(qr_valid) {
-        int side=qr_box_side();
-        rect(l,(240-side)/2,qr_box_top(),side,side,0xffffff);
+        rect(l,(240-QR_BOX_SIDE)/2,QR_BOX_TOP,QR_BOX_SIDE,QR_BOX_SIDE,0xffffff);
     } else CENTER(l,28,151,184,state.modal==BADGE_MODAL_WIFI?(wifi_ready?"QR UNAVAILABLE":setup_waiting?"SETUP AFTER FETCH":"WAITING FOR HOTSPOT"):"QR UNAVAILABLE",&badge_font_8,t->muted);
     rect(l,19,263,202,12,t->accent);
     center_ascii(l,19,263,202,12,"[OK] CLOSE",&badge_font_8,t->background);
@@ -675,6 +669,43 @@ static void draw(lv_event_t *event)
     }
 }
 
+static bool render_qr(const char *content)
+{
+    uint8_t code[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_VERSION)];
+    uint8_t input[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_VERSION)];
+    size_t length=strlen(content);
+    if(length>sizeof(input))return false;
+    memcpy(input,content,length);
+    if(!qrcodegen_encodeBinary(input,length,code,qrcodegen_Ecc_MEDIUM,
+                              QR_VERSION,QR_VERSION,qrcodegen_Mask_AUTO,true))return false;
+
+    lv_draw_buf_t *buffer=lv_canvas_get_draw_buf(qr);
+    if(!buffer || buffer->header.w!=QR_SIDE || buffer->header.h!=QR_SIDE ||
+       buffer->header.cf!=LV_COLOR_FORMAT_I1) {
+        lv_qrcode_set_size(qr,QR_SIDE);
+        buffer=lv_canvas_get_draw_buf(qr);
+    }
+    /* set_size is void and preserves the previous buffer on OOM. */
+    if(!buffer || buffer->header.w!=QR_SIDE || buffer->header.h!=QR_SIDE ||
+       buffer->header.cf!=LV_COLOR_FORMAT_I1)return false;
+    lv_image_cache_drop(buffer);
+    lv_draw_buf_clear(buffer,NULL);
+    lv_canvas_set_palette(qr,0,lv_color_to_32(lv_color_white(),LV_OPA_COVER));
+    lv_canvas_set_palette(qr,1,lv_color_to_32(lv_color_black(),LV_OPA_COVER));
+    /* LVGL's QR update always chooses the payload's minimum version. Encode
+     * the shared version explicitly, then fill its indexed canvas row-wise. */
+    for(unsigned y=0;y<QR_MODULES;++y) {
+        uint8_t *row=lv_draw_buf_goto_xy(buffer,0,y*QR_SCALE);
+        for(unsigned x=0;x<QR_SIDE;++x)
+            if(qrcodegen_getModule(code,x/QR_SCALE,y))row[x/8]|=(uint8_t)(1u<<(7-x%8));
+        for(unsigned repeat=1;repeat<QR_SCALE;++repeat)
+            memcpy(lv_draw_buf_goto_xy(buffer,0,y*QR_SCALE+repeat),row,buffer->header.stride);
+    }
+    lv_obj_set_pos(qr,(240-QR_BOX_SIDE)/2+QR_INSET,QR_BOX_TOP+QR_INSET);
+    lv_obj_invalidate(qr);
+    return true;
+}
+
 static void update_qr(void)
 {
     if(state.modal==BADGE_MODAL_NONE) {
@@ -698,21 +729,7 @@ static void update_qr(void)
         lv_qrcode_set_quiet_zone(qr,false);
     }
     if(qr_modal!=state.modal || strcmp(qr_content,content)) {
-        int box=qr_box_side();
-        int version=qrcodegen_getMinFitVersion(qrcodegen_Ecc_MEDIUM,strlen(content));
-        int modules=qrcodegen_version2size(version);
-        int scale=modules>0?box/(modules+2*QR_QUIET_MODULES):0;
-        int side=modules*scale, inset=(box-side)/2;
-        qr_valid=false;
-        if(scale>0) {
-            lv_qrcode_set_size(qr,side);
-            lv_obj_set_pos(qr,(240-box)/2+inset,qr_box_top()+inset);
-            const lv_draw_buf_t *buffer=lv_canvas_get_draw_buf(qr);
-            /* set_size is void and preserves the previous buffer on OOM. */
-            qr_valid=buffer && buffer->header.w==(uint32_t)side &&
-                     buffer->header.h==(uint32_t)side &&
-                     lv_qrcode_update(qr,content,strlen(content))==LV_RESULT_OK;
-        }
+        qr_valid=render_qr(content);
         snprintf(qr_content,sizeof(qr_content),"%s",content);qr_modal=state.modal;
     }
     if(qr_valid)lv_obj_remove_flag(qr,LV_OBJ_FLAG_HIDDEN);else lv_obj_add_flag(qr,LV_OBJ_FLAG_HIDDEN);

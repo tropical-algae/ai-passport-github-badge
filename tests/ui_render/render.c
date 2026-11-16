@@ -58,11 +58,10 @@ static uint32_t frame_hash(void) {
     for(unsigned i=0;i<240*320;i++)hash=(hash^framebuffer[i])*16777619u;
     return hash;
 }
-static void assert_qr_payload(const char *payload,int x,int y,int box) {
-    int version=qrcodegen_getMinFitVersion(qrcodegen_Ecc_MEDIUM,strlen(payload));
-    int modules=qrcodegen_version2size(version),scale=box/(modules+8);
-    int inset=(box-modules*scale)/2;
-    assert(version>0 && version<=10 && scale>0 && inset>=4*scale);
+static void assert_qr_payload(const char *payload) {
+    /* Both dialogs must have the Wi-Fi layout's exact visible geometry,
+     * including short profile URLs which would normally use fewer modules. */
+    const int x=58,y=79,box=123,version=4,modules=33,scale=3,inset=12;
     uint8_t code[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
     uint8_t input[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
     memcpy(input,payload,strlen(payload));
@@ -303,7 +302,7 @@ int main(int argc,char **argv) {
     for(unsigned i=0;i<5;i++)badge_ui_key(BADGE_KEY_DOWN,true);
     badge_ui_key(BADGE_KEY_OK,false);save("profile-qr");
     char profile_url[80];snprintf(profile_url,sizeof(profile_url),"https://github.com/%s",config.username);
-    assert_qr_payload(profile_url,50,81,140);
+    assert_qr_payload(profile_url);
     assert_ink_centered("profile close",19,263,202,12,0x080f0b);badge_ui_key(BADGE_KEY_OK,false);
     badge_ui_key(BADGE_KEY_OK,true);save("settings");
     assert_font_text_ink("> AUTO SCREEN OFF",16,102,163,0x2ee4a4,&badge_font_10);
@@ -335,7 +334,7 @@ int main(int argc,char **argv) {
     confirmed=badge_ui_key(BADGE_KEY_OK,false);assert(confirmed.kind==BADGE_ACTION_THEME&&confirmed.value==0);save("theme-confirmed");
     badge_ui_key(BADGE_KEY_OK,true);
     status.provisioning=true;badge_ui_show_provision();badge_ui_tick(&status);save("wifi");
-    assert_qr_payload("WIFI:T:WPA;S:GitHubBadge-A1B2C3;P:ABCDEFGH2345;;",58,79,123);
+    assert_qr_payload("WIFI:T:WPA;S:GitHubBadge-A1B2C3;P:ABCDEFGH2345;;");
     assert_text_ink(status.ap_ssid,59,211,162,0x2ee4a4);
     assert_font_text_ink(status.ap_password,59,228,162,0x2ee4a4,&badge_font_10);
     assert_text_ink("192.168.4.1",19,245,202,0x2ee4a4);
@@ -347,7 +346,7 @@ int main(int argc,char **argv) {
     status.provisioning=false;status.ap_ssid[0]=0;badge_ui_tick(&status);
     badge_ui_show_provision();save("wifi-starting");assert_wifi_waiting();
     status.provisioning=true;strcpy(status.ap_ssid,"GitHubBadge-A1B2C3");badge_ui_tick(&status);save("wifi-ready");
-    assert_qr_payload("WIFI:T:WPA;S:GitHubBadge-A1B2C3;P:ABCDEFGH2345;;",58,79,123);
+    assert_qr_payload("WIFI:T:WPA;S:GitHubBadge-A1B2C3;P:ABCDEFGH2345;;");
     badge_ui_close_provision();badge_ui_show_provision();save("wifi-reopened-waiting");assert_wifi_waiting();
     status.provisioning_session=2;status.provisioning_busy=true;
     badge_ui_tick(&status);save("wifi-old-session-busy");assert_wifi_waiting();
@@ -355,19 +354,41 @@ int main(int argc,char **argv) {
     badge_ui_tick(&status);save("wifi-old-session-mismatch");assert_wifi_waiting();
     status.provisioning_ready_session=2;strcpy(status.ap_password,"9876ABCDEFGH");
     badge_ui_tick(&status);save("wifi-new-session-ready");
-    assert_qr_payload("WIFI:T:WPA;S:GitHubBadge-A1B2C3;P:9876ABCDEFGH;;",58,79,123);
+    assert_qr_payload("WIFI:T:WPA;S:GitHubBadge-A1B2C3;P:9876ABCDEFGH;;");
     assert_font_text_ink(status.ap_password,59,228,162,0x2ee4a4,&badge_font_10);
     strcpy(status.ap_password,"WWWWWWWWWWWW");badge_ui_tick(&status);save("wifi-wide-password");
+    assert_qr_payload("WIFI:T:WPA;S:GitHubBadge-A1B2C3;P:WWWWWWWWWWWW;;");
     assert_font_text_ink(status.ap_password,59,228,162,0x2ee4a4,&badge_font_10);
+    /* Unsupported future payloads must not leave the previous QR visible. */
+    memset(status.ap_ssid,'W',sizeof(status.ap_ssid)-1);status.ap_ssid[sizeof(status.ap_ssid)-1]=0;
+    memset(status.ap_password,'W',sizeof(status.ap_password)-1);status.ap_password[sizeof(status.ap_password)-1]=0;
+    badge_ui_tick(&status);save("wifi-qr-over-capacity");
+    for(int y=79;y<202;++y)for(int x=58;x<181;++x)
+        assert(framebuffer[y*240+x]!=0xffff);
+    assert_text_ink("QR UNAVAILABLE",28,151,184,0x91a89b);
+    strcpy(status.ap_ssid,"GitHubBadge-A1B2C3");
+    strcpy(status.ap_password,"ABCDEFGH2345");badge_ui_tick(&status);lv_refr_now(display);
+    assert_qr_payload("WIFI:T:WPA;S:GitHubBadge-A1B2C3;P:ABCDEFGH2345;;");
     status.ap_password[0]=0;badge_ui_tick(&status);save("wifi-incomplete-credentials");assert_wifi_waiting();
     status.provisioning=false;badge_ui_tick(&status);save("wifi-stopped-waiting");assert_wifi_waiting();
     /* Only the application can close a session after success or a stopped AP. */
     badge_ui_close_provision();save("wifi-closed");
+    /* Every supported username length keeps the same visible QR and margin.
+     * This also exercises cached canvas replacement without stale pixels. */
+    badge_ui_key(BADGE_KEY_OK,false);
+    for(unsigned length=1;length<=39;++length) {
+        memset(config.username,'a',length);config.username[length]=0;
+        badge_ui_update(&data,&config,&status);lv_refr_now(display);
+        snprintf(profile_url,sizeof(profile_url),"https://github.com/%s",config.username);
+        assert_qr_payload(profile_url);
+        if(length==1)save("short-profile-qr");
+    }
+    badge_ui_key(BADGE_KEY_OK,false);
     /* Exercise the maximum GitHub username QR and viewport clipping. */
     strcpy(config.username,"abcdefghijklmnopqrstuvwxyz0123456789abc");
     badge_ui_update(&data,&config,&status);badge_ui_key(BADGE_KEY_OK,false);save("long-profile-qr");
     snprintf(profile_url,sizeof(profile_url),"https://github.com/%s",config.username);
-    assert_qr_payload(profile_url,50,81,140);
+    assert_qr_payload(profile_url);
     badge_ui_key(BADGE_KEY_OK,false);
     for(unsigned n=0;n<35;n++){badge_ui_key(BADGE_KEY_DOWN,true);lv_refr_now(display);}
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
@@ -414,11 +435,11 @@ int main(int argc,char **argv) {
     badge_ui_close_provision();save("profile-qr-preserved");assert(frame_hash()==baseline);
     badge_ui_notify("SYNC COMPLETE",false);save("toast-over-profile-qr");assert(frame_hash()!=baseline);
     badge_ui_notify(NULL,false);lv_refr_now(display);assert(frame_hash()==baseline);
-    uint32_t qr_pixels=area_hash(50,81,140,140),footer_pixels=area_hash(0,293,240,27);
+    uint32_t qr_pixels=area_hash(58,79,123,123),footer_pixels=area_hash(0,293,240,27);
     badge_ui_notify("RATE LIMIT / 4M 12S\nACTIVITY / HTTP 403",true);save("toast-two-lines-profile-qr");
     assert_text_ink("RATE LIMIT / 4M 12S",14,262,212,0xf17b5c);
     assert_text_ink("ACTIVITY / HTTP 403",14,275,212,0xf17b5c);
-    assert(area_hash(50,81,140,140)==qr_pixels && area_hash(0,293,240,27)==footer_pixels);
+    assert(area_hash(58,79,123,123)==qr_pixels && area_hash(0,293,240,27)==footer_pixels);
     badge_ui_notify(NULL,false);lv_refr_now(display);assert(frame_hash()==baseline);
     badge_ui_key(BADGE_KEY_OK,false);badge_ui_key(BADGE_KEY_OK,true);
     badge_ui_key(BADGE_KEY_DOWN,false);badge_ui_key(BADGE_KEY_DOWN,false);badge_ui_key(BADGE_KEY_DOWN,false);
