@@ -28,7 +28,12 @@ static unsigned repo_page_requests;
 static size_t gist_filler_size = 32 * 1024;
 static unsigned profiles, lang_a, lang_b, publications, watch_b, starred_requests;
 static unsigned avatar_requests, events_requests, search_requests, request_serial, avatar_serial, events_serial;
-static unsigned premature_page_writes;
+static unsigned clients_created, clients_cleaned, clients_live, reused_requests, url_updates;
+static unsigned fail_reused_open, fail_reused_headers, fail_url_update, fail_init, fail_header;
+static unsigned fail_next_fresh_open;
+static bool fail_stale_reconnect;
+static const char *connection_close_match, *read_failure_match;
+static unsigned read_failures, premature_page_writes;
 static const char *profile_name = "Alpha";
 static badge_data_t last_publication;
 static badge_data_t durable_publication;
@@ -41,6 +46,8 @@ struct test_http_client {
     int status;
     bool truncated;
     bool generated_body;
+    bool opened;
+    bool reused_response;
 };
 
 int esp_crt_bundle_attach(void *conf) { (void)conf; return 0; }
@@ -48,17 +55,50 @@ void vTaskDelay(unsigned ticks) { (void)ticks; }
 
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config)
 {
+    if (fail_init) { --fail_init; return NULL; }
     struct test_http_client *client = calloc(1, sizeof(*client)); assert(client);
+    ++clients_created; assert(++clients_live == 1); /* Never retain two TLS working sets. */
     client->config = *config; snprintf(client->url, sizeof(client->url), "%s", config->url);
     assert(config->disable_auto_redirect && config->crt_bundle_attach && config->timeout_ms <= 15000);
     return client;
 }
+esp_err_t esp_http_client_set_url(esp_http_client_handle_t c, const char *url)
+{
+    assert(c->opened && esp_http_client_is_complete_data_received(c));
+    assert(esp_http_client_is_persistent_connection(c));
+    assert(strstr(c->url, "https://api.github.com/") == c->url);
+    assert(strstr(url, "https://api.github.com/") == url); /* No cross-origin reuse. */
+    ++url_updates;
+    if (fail_url_update) { --fail_url_update; return ESP_FAIL; }
+    snprintf(c->url, sizeof(c->url), "%s", url);
+    return ESP_OK;
+}
 esp_err_t esp_http_client_set_header(esp_http_client_handle_t client, const char *key, const char *value)
-{ (void)client; (void)key; (void)value; return ESP_OK; }
+{
+    (void)client; (void)key; (void)value;
+    if (fail_header) { --fail_header; return ESP_FAIL; }
+    return ESP_OK;
+}
 
 esp_err_t esp_http_client_open(esp_http_client_handle_t c, int write_len)
 {
     (void)write_len;
+    bool reused = c->opened;
+    if (!reused && fail_next_fresh_open) { --fail_next_fresh_open; return ESP_FAIL; }
+    if (reused) {
+        assert(esp_http_client_is_complete_data_received(c));
+        ++reused_requests;
+        if (fail_reused_open) {
+            --fail_reused_open;
+            if (fail_stale_reconnect) { fail_next_fresh_open = 1; fail_stale_reconnect = false; }
+            return ESP_FAIL;
+        }
+    }
+    c->opened = true;
+    c->reused_response = reused;
+    c->position = c->length = c->filler_size = 0;
+    c->payload[0] = c->generated_tail[0] = 0;
+    c->truncated = c->generated_body = false;
     c->status = 200;
     ++request_serial;
     const char *body = NULL;
@@ -127,6 +167,7 @@ esp_err_t esp_http_client_open(esp_http_client_handle_t c, int write_len)
 
 int64_t esp_http_client_fetch_headers(esp_http_client_handle_t c)
 {
+    if (fail_reused_headers && c->reused_response) { --fail_reused_headers; return -1; }
     if (custom_headers && fail_match && (fail_exact ? !strcmp(c->url, fail_match) : strstr(c->url, fail_match) != NULL)) {
         const char *names[] = {"X-RateLimit-Remaining", "Retry-After", "X-RateLimit-Reset", "X-RateLimit-Resource"};
         const char *values[] = {fixture_remaining, fixture_retry_after, fixture_reset, fixture_resource};
@@ -145,6 +186,9 @@ int64_t esp_http_client_fetch_headers(esp_http_client_handle_t c)
 int esp_http_client_get_status_code(esp_http_client_handle_t c) { return c->status; }
 int esp_http_client_read(esp_http_client_handle_t c, char *buffer, int length)
 {
+    if (read_failure_match && strstr(c->url, read_failure_match) && read_failures) {
+        --read_failures; return -1;
+    }
     size_t remaining = c->length - c->position;
     if (!remaining) return 0;
     size_t chunk = remaining < 7 ? remaining : 7; /* split UTF-8/JSON tokens */
@@ -162,7 +206,13 @@ int esp_http_client_read(esp_http_client_handle_t c, char *buffer, int length)
 }
 bool esp_http_client_is_complete_data_received(esp_http_client_handle_t c)
 { return !c->truncated && c->position == c->length; }
-esp_err_t esp_http_client_cleanup(esp_http_client_handle_t c) { free(c); return ESP_OK; }
+bool esp_http_client_is_persistent_connection(esp_http_client_handle_t c)
+{ return !(connection_close_match && strstr(c->url, connection_close_match)); }
+esp_err_t esp_http_client_cleanup(esp_http_client_handle_t c)
+{
+    assert(c && clients_live == 1); --clients_live; ++clients_cleaned;
+    free(c); return ESP_OK;
+}
 
 static void observe_job_write(const void *data, size_t size);
 
@@ -179,6 +229,7 @@ bool badge_file_write(const char *path, const void *data, size_t size)
 }
 static bool publish(const badge_data_t *data, void *context)
 {
+    assert(!clients_live); /* TLS RAM must be released before snapshot storage. */
     assert(badge_data_valid(data)); /* Production storage guards every checkpoint. */
     (void)context; last_publication = *data; ++publications;
     if (reject_publication_match && strstr(data->sync_message, reject_publication_match)) return false;
@@ -669,6 +720,79 @@ int main(void)
         assert(data.last_attempt == correct_attempt && data.last_success == correct_success && badge_data_valid(&data));
     }
     test_now = correct_now;
+
+    /* Persistent same-origin responses share the transport between snapshot
+     * checkpoints. The observer also asserts one live client at most and no
+     * retained TLS allocations during durable snapshot publication. */
+    test_now += config.interval_sec;
+    unsigned created_before = clients_created, reused_before = reused_requests;
+    requests_before = request_serial;
+    assert(badge_sync_run(&config, &data, publish, NULL) == ESP_OK);
+    assert(request_serial == requests_before + 17);
+    assert(clients_created == created_before + 11 && reused_requests == reused_before + 6);
+    assert(clients_live == 0 && clients_created == clients_cleaned);
+    check_complete(&data);
+
+    /* A server explicitly refusing persistence must get a fresh client even
+     * when its successful body was completely consumed. */
+    test_now += config.interval_sec; connection_close_match = "/search/issues?";
+    created_before = clients_created; reused_before = reused_requests;
+    assert(badge_sync_run(&config, &data, publish, NULL) == ESP_OK);
+    assert(clients_created == created_before + 16 && reused_requests == reused_before + 1);
+    connection_close_match = NULL;
+
+    /* A silently closed idle socket is retried once before body parsing.
+     * Either the request write or header read can discover the stale socket. */
+    for (unsigned failure = 0; failure < 2; ++failure) {
+        test_now += config.interval_sec; created_before = clients_created;
+        if (failure) fail_reused_headers = 1; else fail_reused_open = 1;
+        assert(badge_sync_run(&config, &data, publish, NULL) == ESP_OK);
+        assert(!fail_reused_open && !fail_reused_headers && clients_created == created_before + 12);
+        assert(!clients_live); check_complete(&data);
+    }
+
+    /* If the one fresh retry also fails, stop this section rather than
+     * repeatedly reconnecting. The already saved first query is not replayed. */
+    test_now += config.interval_sec; fail_reused_open = 1; fail_stale_reconnect = true;
+    search_before = search_requests;
+    assert(badge_sync_run_request(&config, &data, publish, NULL, true, &result) == ESP_FAIL);
+    assert(!fail_reused_open && !fail_next_fresh_open && !fail_stale_reconnect && !clients_live);
+    assert(result.pending == BADGE_PULLS && search_requests == search_before + 4);
+    assert(badge_sync_run_request(&config, &data, publish, NULL, true, &result) == ESP_OK);
+    assert(search_requests == search_before + 7); check_complete(&data);
+
+    /* Cancellation while reading a reused transport releases it immediately
+     * and leaves only its unacknowledged query to be repeated on resume. */
+    test_now += config.interval_sec; cancel_match = "type:pr%20is:open";
+    assert(badge_sync_run_request(&config, &data, publish, NULL, true, &result) == ESP_FAIL);
+    assert(result.cancelled && !clients_live);
+    cancel_match = NULL;
+    assert(badge_sync_run_request(&config, &data, publish, NULL, true, &result) == ESP_OK);
+    check_complete(&data);
+
+    /* A read failure must discard the response rather than replaying its
+     * callback. Resume keeps previously committed endpoints and counts exact. */
+    test_now += config.interval_sec; read_failure_match = "/repos/tester/b/languages"; read_failures = 1;
+    a_before = lang_a; b_before = lang_b;
+    assert(badge_sync_run_request(&config, &data, publish, NULL, true, &result) == ESP_FAIL);
+    assert(!read_failures && !clients_live && lang_a == a_before + 1 && lang_b == b_before + 1);
+    read_failure_match = NULL;
+    assert(badge_sync_run_request(&config, &data, publish, NULL, true, &result) == ESP_OK);
+    assert(lang_a == a_before + 1 && lang_b == b_before + 2); check_complete(&data);
+
+    /* URL/header/client allocation failures release the owned transport;
+     * other stages can still proceed and a manual resume repairs only gaps. */
+    for (unsigned failure = 0; failure < 3; ++failure) {
+        test_now += config.interval_sec;
+        if (failure == 0) fail_url_update = 1;
+        else if (failure == 1) fail_init = 1;
+        else fail_header = 1;
+        assert(badge_sync_run_request(&config, &data, publish, NULL, true, &result) == ESP_FAIL);
+        assert(!fail_url_update && !fail_init && !fail_header && !clients_live);
+        assert(badge_sync_run_request(&config, &data, publish, NULL, true, &result) == ESP_OK);
+        check_complete(&data);
+    }
+    assert(clients_created == clients_cleaned);
 
     char events_path[200]; badge_cache_path(config.username, "events", events_path, sizeof(events_path));
     assert(badge_sync_events_valid(events_path));

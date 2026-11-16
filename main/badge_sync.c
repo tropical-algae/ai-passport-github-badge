@@ -95,6 +95,8 @@ typedef struct {
     unsigned request_count, response_scope;
     bool allow_large_drop;
     bool publish_failed;
+    esp_http_client_handle_t http;
+    bool http_api;
     unsigned response_items, response_skipped;
     char reason[64];
 } sync_t;
@@ -202,8 +204,17 @@ static bool save_job(sync_t *s)
     return ok;
 }
 
+static void close_http(sync_t *s)
+{
+    if (s->http) esp_http_client_cleanup(s->http);
+    s->http = NULL;
+}
+
 static void progress(sync_t *s, const char *message)
 {
+    /* Snapshot validation/storage needs its own bounded working set. Reuse
+     * connections between checkpoints, never keep TLS RAM over publication. */
+    close_http(s);
     copy_text(s->data->sync_message, sizeof(s->data->sync_message), message);
     if (s->publish && !s->publish(s->data, s->publish_context)) s->publish_failed = true;
 }
@@ -325,7 +336,8 @@ static bool rate_error_body(esp_http_client_handle_t client)
 
 static esp_http_client_handle_t open_http(sync_t *s, const char *url)
 {
-    unsigned scope = strncmp(url, API "/", sizeof(API)) ? BADGE_SYNC_LIMIT_AVATAR :
+    bool api = strncmp(url, API "/", sizeof(API)) == 0;
+    unsigned scope = !api ? BADGE_SYNC_LIMIT_AVATAR :
         s->search_bucket ? BADGE_SYNC_LIMIT_SEARCH : BADGE_SYNC_LIMIT_CORE;
     s->retry = 0; s->reset = 0; s->remaining = -1; s->rate_seen = s->retry_seen = false;
     s->response_scope = scope; s->http_status = 0;
@@ -342,15 +354,39 @@ static esp_http_client_handle_t open_http(sync_t *s, const char *url)
         .event_handler = header_event, .user_data = s,
         .user_agent = "GitHub-Pixel-Passport/1.0", .keep_alive_enable = false,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) { copy_text(s->reason, sizeof(s->reason), "HTTP MEMORY LIMIT"); return NULL; }
-    esp_http_client_set_header(client, "Accept", "application/vnd.github+json");
-    esp_http_client_set_header(client, "X-GitHub-Api-Version", "2022-11-28");
-    ++s->request_count;
-    if (esp_http_client_open(client, 0) != ESP_OK || esp_http_client_fetch_headers(client) < 0) {
-        copy_text(s->reason, sizeof(s->reason), "NETWORK / TLS ERROR");
-        esp_http_client_cleanup(client); return NULL;
+    /* Keep at most one TLS connection, and never carry it across origins.
+     * TCP keep-alive probes are independent of HTTP connection reuse. */
+    if (s->http && s->http_api != api) close_http(s);
+    bool reused = s->http != NULL;
+    for (unsigned attempt = 0; ; ++attempt) {
+        if (atomic_load(&s_cancel)) {
+            close_http(s); copy_text(s->reason, sizeof(s->reason), "SYNC CANCELLED"); return NULL;
+        }
+        if (s->http) {
+            if (esp_http_client_set_url(s->http, url) != ESP_OK) {
+                close_http(s); copy_text(s->reason, sizeof(s->reason), "HTTP MEMORY LIMIT"); return NULL;
+            }
+        } else {
+            s->http = esp_http_client_init(&config); s->http_api = api;
+            if (!s->http ||
+                esp_http_client_set_header(s->http, "Accept", "application/vnd.github+json") != ESP_OK ||
+                esp_http_client_set_header(s->http, "X-GitHub-Api-Version", "2022-11-28") != ESP_OK) {
+                close_http(s); copy_text(s->reason, sizeof(s->reason), "HTTP MEMORY LIMIT"); return NULL;
+            }
+        }
+        /* A peer may close an otherwise persistent socket between requests.
+         * Retry this idempotent GET once, only before a response was accepted;
+         * never retry a status error or replay a partially parsed body here. */
+        s->retry = 0; s->reset = 0; s->remaining = -1;
+        s->rate_seen = s->retry_seen = false; s->response_scope = scope;
+        ++s->request_count;
+        if (esp_http_client_open(s->http, 0) == ESP_OK && esp_http_client_fetch_headers(s->http) >= 0) break;
+        close_http(s);
+        if (!reused || attempt) {
+            copy_text(s->reason, sizeof(s->reason), "NETWORK / TLS ERROR"); return NULL;
+        }
     }
+    esp_http_client_handle_t client = s->http;
     s->http_status = esp_http_client_get_status_code(client);
     bool primary = s->rate_seen && s->remaining == 0;
     bool body_limited = s->http_status == 403 && !primary && !s->retry_seen && rate_error_body(client);
@@ -381,16 +417,24 @@ static esp_http_client_handle_t open_http(sync_t *s, const char *url)
         set_limit(s->job, scopes, limited_until, s->reason);
         /* Persist limits before cleanup/rollback. They survive a failed dataset
          * publication, a fresh collection cycle, and a power loss after this response. */
-        if (!save_job(s)) { esp_http_client_cleanup(client); return NULL; }
+        if (!save_job(s)) { close_http(s); return NULL; }
     }
     if (s->http_status != 200) {
         if (!(primary || secondary || server_wait)) {
             if (s->http_status == 404) copy_text(s->reason, sizeof(s->reason), "ACCOUNT / RESOURCE NOT FOUND");
             else snprintf(s->reason, sizeof(s->reason), "GITHUB HTTP %d - RETRY", s->http_status);
         }
-        esp_http_client_cleanup(client); return NULL;
+        close_http(s); return NULL;
     }
     return client;
+}
+
+static void finish_http(sync_t *s, bool ok)
+{
+    /* Reuse only fully consumed, valid responses with persistent framing.
+     * A malformed/oversized body, cancellation, or Connection: close needs a
+     * fresh transport even when a later independent stage can still run. */
+    if (!ok || atomic_load(&s_cancel) || !esp_http_client_is_persistent_connection(s->http)) close_http(s);
 }
 
 typedef bool (*json_fn)(const cJSON *json, void *ctx);
@@ -414,7 +458,7 @@ static bool request_json(sync_t *s, const char *path, bool array, json_fn callba
     char *object_buffer = malloc(JSON_OBJECT_BYTES);
     if (!object_buffer) {
         copy_text(s->reason, sizeof(s->reason), "JSON MEMORY LIMIT");
-        esp_http_client_cleanup(client); return false;
+        close_http(s); return false;
     }
     json_callback_t cb = { callback, context };
     badge_json_stream_t stream;
@@ -438,7 +482,7 @@ static bool request_json(sync_t *s, const char *path, bool array, json_fn callba
     ok = ok && badge_json_stream_done(&stream) && esp_http_client_is_complete_data_received(client);
     s->response_items = stream.items; s->response_skipped = stream.dropped;
     free(object_buffer);
-    esp_http_client_cleanup(client);
+    finish_http(s, ok);
     if (!ok && !s->reason[0]) copy_text(s->reason, sizeof(s->reason), "INCOMPLETE RESPONSE - RETRY");
     return ok;
 }
@@ -581,7 +625,7 @@ static bool request_search(sync_t *s, const char *path, search_value_t *value)
         vTaskDelay(1);
     }
     ok = ok && badge_search_stream_done(&stream) && esp_http_client_is_complete_data_received(client);
-    esp_http_client_cleanup(client);
+    finish_http(s, ok);
     if (ok) { value->count = stream.count; value->incomplete = stream.incomplete; }
     else copy_text(s->reason, sizeof(s->reason), "SEARCH RESPONSE INCOMPLETE");
     return ok;
@@ -880,7 +924,7 @@ static bool collect_avatar(sync_t *s)
     unsigned char *bytes = malloc(24 * 1024);
     if (!bytes) {
         copy_text(s->reason, sizeof(s->reason), "AVATAR MEMORY LIMIT");
-        esp_http_client_cleanup(client); return false;
+        close_http(s); return false;
     }
     size_t used = 0; bool ok = true;
     while (used < 24 * 1024) {
@@ -892,7 +936,9 @@ static bool collect_avatar(sync_t *s)
     }
     unsigned width, height;
     ok = ok && esp_http_client_is_complete_data_received(client) && badge_avatar_dimensions(bytes, used, &width, &height);
-    esp_http_client_cleanup(client);
+    /* The single avatar request has no same-origin successor. Release TLS
+     * before writing its image and publishing the snapshot. */
+    close_http(s);
     if (!ok) copy_text(s->reason, sizeof(s->reason), "AVATAR INVALID / INCOMPLETE IMAGE");
     if (ok) {
         char path[160];
@@ -1287,6 +1333,7 @@ esp_err_t badge_sync_run_request(const badge_config_t *config, badge_data_t *dat
         copy_text(result->detail, sizeof(result->detail), data->sync_message);
         copy_text(result->avatar_error, sizeof(result->avatar_error), s.job->errors[ST_AVATAR]);
     }
+    close_http(&s);
     free(s.job);
     return ok ? ESP_OK : ESP_FAIL;
 }
