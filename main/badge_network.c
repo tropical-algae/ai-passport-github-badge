@@ -1,6 +1,7 @@
 #include "badge_network.h"
 #include "badge_portal.h"
 #include "badge_backup.h"
+#include "badge_network_retry.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -64,8 +65,8 @@ static char s_scan_message[96];
 static int64_t s_scan_deadline;
 static char s_nonce[33];
 static int s_dns = -1;
-static int64_t s_next_connect, s_pending_deadline, s_connect_deadline;
-static unsigned s_failures;
+static int64_t s_pending_deadline, s_connect_deadline;
+static badge_network_retry_t s_retry;
 static esp_event_handler_instance_t s_wifi_handler, s_ip_handler;
 
 static int64_t milliseconds(void) { return esp_timer_get_time() / 1000; }
@@ -91,6 +92,15 @@ static void message(const char *text)
     lock();
     snprintf(s_status.message, sizeof(s_status.message), "%s", text);
     unlock();
+}
+
+static void schedule_reconnect(void)
+{
+    lock();
+    bool interactive = s_provision_requested || s_pending || s_submit_queued || s_save_await;
+    bool have_ssid = ((s_pending || s_save_await) ? s_pending_config.ssid[0] : s_config.ssid[0]) != 0;
+    unlock();
+    if (have_ssid) badge_network_retry_schedule(&s_retry, milliseconds(), interactive);
 }
 
 static void heap_log(const char *phase)
@@ -641,7 +651,7 @@ static esp_err_t connect_config(const badge_config_t *config)
     s_status.connected = false;
     unlock();
     esp_wifi_disconnect();
-    s_next_connect = 0;
+    badge_network_retry_reset(&s_retry);
     if (!config->ssid[0]) return ESP_OK;
     wifi_config_t wifi = {0};
     memcpy(wifi.sta.ssid, config->ssid, strlen(config->ssid));
@@ -651,8 +661,7 @@ static esp_err_t connect_config(const badge_config_t *config)
     wifi.sta.pmf_cfg.capable = true;
     esp_err_t result = esp_wifi_set_config(WIFI_IF_STA, &wifi);
     memset(&wifi, 0, sizeof(wifi));
-    s_failures = 0;
-    s_next_connect = config->ssid[0] ? milliseconds() + 400 : 0;
+    badge_network_retry_request(&s_retry, milliseconds());
     return result;
 }
 
@@ -700,7 +709,14 @@ static esp_err_t start_provisioning(uint32_t session)
     snprintf(s_status.ap_password, sizeof(s_status.ap_password), "%s", password);
     snprintf(s_nonce, sizeof(s_nonce), "%s", nonce);
     snprintf(s_status.message, sizeof(s_status.message), "Join setup Wi-Fi, open 192.168.4.1");
+    bool retry_saved = !s_status.connected && !s_pending && !s_save_await && s_config.ssid[0];
     unlock();
+    /* An explicit setup session should not inherit a several-minute background
+     * wait. An attempt already acquiring an IP can finish without disruption. */
+    if (retry_saved) {
+        badge_network_retry_reset(&s_retry);
+        if (!s_waiting_ip) badge_network_retry_request(&s_retry, milliseconds());
+    }
     heap_log("after AP and HTTP");
     return ESP_OK;
 }
@@ -804,10 +820,9 @@ static void got_ip(void)
     if (commit || !s_status.provisioning || !s_submission_failed)
         snprintf(s_status.message, sizeof(s_status.message), "%s", commit ? "Wi-Fi connected; saving settings" : "Wi-Fi connected");
     unlock();
-    s_next_connect = 0;
+    badge_network_retry_reset(&s_retry);
     s_connect_deadline = 0;
     s_waiting_ip = false;
-    s_failures = 0;
     if (s_sntp_ready) esp_netif_sntp_start();
     if (commit) {
         s_pending_deadline = 0;
@@ -831,7 +846,7 @@ static TickType_t worker_wait_ticks(void)
     int64_t now = milliseconds();
     /* These deadlines are owned by this worker. A scan postpones reconnects,
      * so an already-due retry must not turn that scan into a busy loop. */
-    int64_t deadlines[] = {scanning ? 0 : s_next_connect, s_connect_deadline, close_deadline, provision_retry};
+    int64_t deadlines[] = {scanning ? 0 : s_retry.at, s_connect_deadline, close_deadline, provision_retry};
     for (size_t i = 0; i < sizeof(deadlines) / sizeof(deadlines[0]); ++i) {
         if (!deadlines[i]) continue;
         if (deadlines[i] <= now) return 0;
@@ -929,15 +944,10 @@ static void worker(void *context)
                 if (command.kind == CMD_LOST_IP) esp_wifi_disconnect();
                 lock();
                 s_status.connected = false;
-                bool have_ssid = ((s_pending || s_save_await) ? s_pending_config.ssid[0] : s_config.ssid[0]) != 0;
                 bool is_pending = s_pending;
                 bool ap_active = s_status.provisioning;
                 unlock();
-                if (have_ssid && !s_next_connect) {
-                    unsigned delay = s_failures < 5 ? (1U << s_failures) : 60U;
-                    ++s_failures;
-                    s_next_connect = milliseconds() + delay * 1000;
-                }
+                schedule_reconnect();
                 if (is_pending) message("Wi-Fi not connected yet; check credentials and 2.4 GHz");
                 else if (!ap_active) message("Offline; displaying saved data");
                 if (command.kind == CMD_DISCONNECTED) ESP_LOGI(TAG, "Station disconnected, reason=%d", command.reason);
@@ -965,17 +975,17 @@ static void worker(void *context)
             lock(); snprintf(s_scan_message, sizeof(s_scan_message), "Scan timed out. Refresh or enter the SSID below."); unlock();
         }
         lock(); bool scanning = s_scanning || s_scan_requested; unlock();
-        if (!scanning && s_next_connect && now >= s_next_connect) {
-            s_next_connect = 0;
+        if (!scanning && s_retry.at && now >= s_retry.at) {
+            s_retry.at = 0;
             esp_err_t result = esp_wifi_connect();
-            if (result != ESP_OK) s_next_connect = now + 5000;
+            if (result != ESP_OK) schedule_reconnect();
             else { s_waiting_ip = true; s_connect_deadline = now + 20000; }
         }
         if (s_connect_deadline && now >= s_connect_deadline) {
             s_connect_deadline = 0;
             s_waiting_ip = false;
             esp_wifi_disconnect();
-            s_next_connect = now + 5000;
+            schedule_reconnect();
         }
         lock();
         if (!backup_active && !reboot_deadline && s_close_deadline && now >= s_close_deadline) {

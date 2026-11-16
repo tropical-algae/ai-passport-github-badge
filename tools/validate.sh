@@ -90,6 +90,9 @@ run_static_checks() {
         tests/test_badge_app.c main/badge_model.c main/badge_input.c \
         main/badge_idle.c main/badge_ui_state.c -o "${test_dir}/test_badge_app"
     "${test_dir}/test_badge_app"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_badge_network_retry.c -o "${test_dir}/test_badge_network_retry"
+    "${test_dir}/test_badge_network_retry"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
         -Itests/storage_stubs -Itests/bsp_stubs -Imain \
         tests/test_badge_storage.c main/badge_model.c -o "${test_dir}/test_badge_storage"
