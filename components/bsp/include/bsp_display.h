@@ -59,7 +59,7 @@ void bsp_lvgl_unlock(void);
 // Reversible display power transitions after successful bsp_lvgl_init().
 // Caller MUST hold bsp_lvgl_lock() throughout; task context only, never a button
 // callback/ISR. Sleep pauses this display's refresh timer/invalidation, stops
-// PWM/LCD scanning, and permanently replaces the periodic LVGL tick with a
+// PWM/LCD scanning. Init already replaces the periodic LVGL tick with a
 // continuous monotonic callback. Other LVGL timers keep running normally.
 // Wake restores LCD/refresh/invalidation and a full frame, drains SPI DMA, waits
 // 50 ms for panel scanout/settling, then restores brightness. RGB565 portrait,

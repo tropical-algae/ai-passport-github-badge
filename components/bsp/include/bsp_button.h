@@ -26,9 +26,14 @@ typedef enum {
 // 的有界操作；勿在其中阻塞、访问 LVGL 或做重活。
 typedef void (*bsp_btn_cb_t)(bsp_btn_t btn, bsp_btn_ev_t ev, void *user);
 
-// 成功调用可重复，并更新回调与 user；失败会回滚本次已创建的按键和 ADC 资源。
+// 相同事件模式下可重复调用，并更新回调与 user；运行中切换模式返回
+// ESP_ERR_INVALID_STATE，保留原有回调。失败会回滚本次已创建的按键和 ADC 资源。
 // ADC 校准失败时返回错误而不是把无效电压解码为按键，修正故障后可重试。
 esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user);
+
+// 仅注册 PRESS / RELEASE，适合自行处理短按、长按和唤醒手势的应用。
+// 不分配或分发组件的 CLICK / DOUBLE / LONG 回调；初始化和重试规则同上。
+esp_err_t bsp_button_init_edges(bsp_btn_cb_t cb, void *user);
 
 // deep sleep 专用:停掉三个按键设备、释放共享 ADC unit,再把按键脚交回普通数字输入
 // 并开启上拉(与板上 10k 外部上拉并联)。level 回填当时该脚电平,1 = 松开。

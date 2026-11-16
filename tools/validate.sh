@@ -135,6 +135,8 @@ run_firmware_checks() (
     SDKCONFIG_DEFAULTS="${repo_root}/sdkconfig.defaults" \
         idf.py -B "${validation_build_dir}" \
         -D "SDKCONFIG=${validation_build_dir}/sdkconfig" build
+    # This native-only check uses the exact resolved button component source.
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_button_sampling.py
     ./tools/render_badge_ui.sh "${validation_build_dir}/native-ui"
     idf.py -B "${validation_build_dir}" merge-bin \
         -o "${validation_build_dir}/FoloToy-AI-Passport-full.bin"

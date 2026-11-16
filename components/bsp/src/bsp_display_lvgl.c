@@ -28,6 +28,7 @@ static bool s_suspended, s_lcd_sleeping;
 static bool s_monotonic_tick, s_refresh_paused;
 static uint32_t s_tick_offset;
 static esp_err_t s_flush_error;
+static esp_err_t use_monotonic_tick(void);
 
 static void checked_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *pixels) {
     if (s_refresh_paused) {
@@ -142,6 +143,22 @@ lv_display_t *bsp_lvgl_init(void) {
         ESP_LOGE(TAG, "LVGL 初始化加锁失败");
         return NULL;
     }
+    // Install the read-only clock before the display becomes visible. Keeping
+    // the port's 5 ms tick until the first screen sleep wastes 200 callbacks/s
+    // indefinitely when the user selects NEVER.
+    // Port 2.9.0 notifies its caller before creating the tick timer. A higher
+    // priority caller can get here first; yield for that bounded startup race.
+    esp_err_t clock_result;
+    for (unsigned attempt = 0; ; ++attempt) {
+        clock_result = use_monotonic_tick();
+        if (clock_result != ESP_ERR_INVALID_STATE || attempt == 9) break;
+        vTaskDelay(1);
+    }
+    if (clock_result != ESP_OK) {
+        ESP_LOGE(TAG, "LVGL monotonic clock initialization failed; retry allowed");
+        lvgl_port_unlock();
+        return NULL;
+    }
     lv_display_t *disp = lvgl_port_add_disp(&dc);
     bool callbacks_registered = false;
     if (disp) {
@@ -215,8 +232,7 @@ static void pause_refresh(void) {
     lv_timer_pause(lv_display_get_refr_timer(s_disp));
 }
 
-static esp_err_t prepare_hidden_display(void) {
-    pause_refresh();
+static esp_err_t use_monotonic_tick(void) {
     esp_err_t e = pause_port();
     if (e != ESP_OK) return e;
     if (!s_monotonic_tick) {
@@ -232,6 +248,11 @@ static esp_err_t prepare_hidden_display(void) {
     // display refresh timer; an idle handler can then take its normal long wait.
     lv_timer_enable(true);
     return ESP_OK;
+}
+
+static esp_err_t prepare_hidden_display(void) {
+    pause_refresh();
+    return use_monotonic_tick();
 }
 
 esp_err_t bsp_lvgl_sleep(void) {

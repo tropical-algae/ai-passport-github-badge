@@ -1,5 +1,6 @@
 // No LVGL task may see the display until the rounding callback is registered.
 #include <assert.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include "freertos/task.h"
@@ -20,6 +21,7 @@ static uint32_t (*tick_callback)(void);
 static int64_t monotonic_us = 5000000;
 static int64_t scan_ready_us;
 static unsigned scan_waits;
+static unsigned tick_init_pending, clock_ready_waits;
 static void (*flush_callback)(lv_display_t *, const lv_area_t *, uint8_t *);
 static unsigned fail_draw, draw_calls, flush_ready_calls;
 static unsigned brightness;
@@ -87,12 +89,14 @@ uint32_t lv_display_get_event_count(lv_display_t *disp) {
     return 4 + callback_live + (refresh_guard != NULL);
 }
 esp_err_t lvgl_port_stop(void) {
+    if (tick_init_pending) return ESP_ERR_INVALID_STATE;
     trace('S'); timer_enabled = false; // Real port changes this before timer_stop.
     if (fail_stop) { --fail_stop; return ESP_FAIL; }
     if (!tick_active) return ESP_ERR_INVALID_STATE;
     tick_active = false; return ESP_OK;
 }
 esp_err_t lvgl_port_resume(void) {
+    if (tick_init_pending) return ESP_ERR_INVALID_STATE;
     trace('R'); timer_enabled = true; // Real port changes this before timer_start.
     if (fail_resume) { --fail_resume; return ESP_FAIL; }
     if (tick_active) return ESP_ERR_INVALID_STATE;
@@ -173,6 +177,13 @@ esp_err_t esp_lcd_panel_io_tx_param(esp_lcd_panel_io_handle_t io, int command,
     dma_pending = false; return ESP_OK;
 }
 void vTaskDelay(TickType_t ticks) {
+    if (!s_disp) {
+        assert(lock_depth && ticks == 1 && tick_init_pending);
+        ++clock_ready_waits;
+        if (tick_init_pending != UINT_MAX && !--tick_init_pending) tick_active = true;
+        monotonic_us += (int64_t)ticks * 1000;
+        return;
+    }
     trace('W');
     assert(!brightness && !lcd_asleep && !dma_pending && !s_flush_error);
     assert(ticks >= 50 && ticks <= 70); // A bounded, yielding scanout guard.
@@ -306,12 +317,26 @@ int main(void) {
     s_port_init_failed = false; // Simulate reboot for remaining scenarios.
     fail_lock = 1; expect_failure(); fail_lock = 0;
     const int retained_init_calls = init_calls;
+    fail_stop = fail_resume = 1; expect_failure();
+    assert(s_port_power == PORT_UNKNOWN && !s_monotonic_tick);
+    assert(timer_enabled && tick_active); // Failed clock setup exposes no display.
+    tick_init_pending = UINT_MAX; tick_active = false;
+    expect_failure(); // A permanently missing timer fails without an unbounded wait.
+    assert(clock_ready_waits == 9 && !s_monotonic_tick);
+    tick_init_pending = 2;
     fail_display = 1; expect_failure(); fail_display = 0;
+    assert(clock_ready_waits == 11 && !tick_init_pending && s_monotonic_tick && !tick_active);
     fail_event = 1; expect_failure(); fail_event = 0;
     fail_guard = 1; expect_failure(); fail_guard = 0;
     assert(bsp_lvgl_init() == &display);
     assert(init_calls == retained_init_calls); // Display retries reuse the port.
     assert(callback_live && !lock_depth && unlocked_flushes == 1);
+    assert(s_monotonic_tick && !tick_active && timer_enabled && !refresh_timer.paused);
+    uint32_t initial_tick = lv_tick_get();
+    monotonic_us += 60000000;
+    assert(lv_tick_get() == initial_tick + 60000); // Works before the first sleep.
+    monotonic_us += (int64_t)UINT32_MAX * 1000;
+    assert(lv_tick_get() == initial_tick + 59999); // Natural uint32_t tick wrap.
     const int before = init_calls;
     assert(bsp_lvgl_init() == &display && init_calls == before);
     assert(bsp_lvgl_lock(5)); bsp_lvgl_unlock();

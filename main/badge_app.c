@@ -580,7 +580,7 @@ void app_main(void) {
         s_provision_open = s_provision_pending = true;
         if (bsp_lvgl_lock(1000)) { badge_ui_show_provision(); bsp_lvgl_unlock(); }
     }
-    ESP_ERROR_CHECK(bsp_button_init(on_key, NULL));
+    ESP_ERROR_CHECK(bsp_button_init_edges(on_key, NULL));
     if (xTaskCreate(app_task, "badge_app", 6144, NULL, 5, NULL) != pdPASS)
         ESP_LOGE(TAG, "Application task allocation failed");
     ESP_LOGI(TAG, "GitHub badge ready; data=%u bytes; free=%lu largest=%lu",

@@ -153,7 +153,7 @@ void vTaskDelete(TaskHandle_t task)
 }
 void vTaskDelay(TickType_t ticks) { test_monotonic += (int64_t)ticks * 1000; }
 
-esp_err_t bsp_button_init(bsp_btn_cb_t callback, void *context) { (void)callback; (void)context; return ESP_OK; }
+esp_err_t bsp_button_init_edges(bsp_btn_cb_t callback, void *context) { (void)callback; (void)context; return ESP_OK; }
 esp_err_t bsp_i2c_init(void) { return ESP_OK; }
 esp_err_t bsp_display_init(void) { return ESP_OK; }
 void *bsp_lvgl_init(void) { return &test_ui; }

@@ -40,6 +40,11 @@ CONFIG_PM_DFS_INIT_AUTO=y
 # This startup-only stack is freed when app_main returns (IDF adds 512 bytes).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 
+# The shared ADC keypad needs polling even with the display off. Sample at
+# 100 Hz instead of the component's 200 Hz default; require two stable samples.
+CONFIG_BUTTON_PERIOD_TIME_MS=10
+CONFIG_BUTTON_DEBOUNCE_TICKS=2
+
 # --- GitHub badge: Wi-Fi, local provisioning, offline assets ---
 CONFIG_BT_ENABLED=n
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y

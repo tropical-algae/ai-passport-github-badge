@@ -4,13 +4,19 @@
 #include <stdio.h>
 #include "../components/bsp/src/bsp_button.c"
 
-struct button_dev_t { button_driver_t *driver; bool live; };
+struct button_dev_t {
+    button_driver_t *driver;
+    bool live;
+    button_cb_t callbacks[5];
+    void *contexts[5];
+};
 static struct button_dev_t buttons[BSP_BTN_COUNT];
 static int adc_token, cal_token, adc_live, cal_live, live_buttons;
 static int create_calls, callback_calls, fail_create, fail_callback;
 static int fail_adc, fail_channel, fail_cal, fail_read, fail_convert, fail_delete;
 static int raw_mv, reads, events;
 static int64_t clock_us;
+static unsigned registered[5], edge_events;
 
 esp_err_t adc_oneshot_new_unit(const adc_oneshot_unit_init_cfg_t *cfg, adc_oneshot_unit_handle_t *h) {
     assert(cfg->unit_id == BSP_BTN_ADC_UNIT && !adc_live);
@@ -89,10 +95,14 @@ esp_err_t iot_button_delete(button_handle_t h) {
     h->live = false; --live_buttons; return ESP_OK;
 }
 esp_err_t iot_button_register_cb(button_handle_t h, button_event_t ev, button_event_args_t *args, button_cb_t cb, void *u) {
-    (void)args; (void)ev;
+    (void)args;
     assert(h->live);
     cb(h, u); // No user callbacks may escape a partial initialization.
-    return ++callback_calls == fail_callback ? ESP_ERR_NO_MEM : ESP_OK;
+    if (++callback_calls == fail_callback) return ESP_ERR_NO_MEM;
+    h->callbacks[ev] = cb;
+    h->contexts[ev] = u;
+    ++registered[ev];
+    return ESP_OK;
 }
 static void event_cb(bsp_btn_t btn, bsp_btn_ev_t ev, void *u) {
     assert(btn == BSP_BTN_OK && ev == BSP_BTN_CLICK && u == &events);
@@ -101,9 +111,10 @@ static void event_cb(bsp_btn_t btn, bsp_btn_ev_t ev, void *u) {
 static void reset_faults(void) {
     fail_adc = fail_channel = fail_cal = fail_read = fail_convert = fail_delete = 0;
     fail_create = fail_callback = create_calls = callback_calls = 0;
+    for (unsigned i = 0; i < 5; ++i) registered[i] = 0;
 }
 static void assert_clean(void) {
-    assert(!adc_live && !cal_live && !live_buttons && !s_ready && !s_adc && !s_cali);
+    assert(!adc_live && !cal_live && !live_buttons && !s_ready && !s_edges_only && !s_adc && !s_cali);
     for (int i = 0; i < BSP_BTN_COUNT; ++i) assert(!s_btn[i]);
 }
 
@@ -171,6 +182,53 @@ static void check_voltage(int mv, int expected) {
     }
     assert(reads - before == CONFIG_ADC_BUTTON_SAMPLE_TIMES);
 }
+
+static void edge_cb(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
+    assert(btn == BSP_BTN_OK && user == &edge_events);
+    assert(ev == BSP_BTN_PRESS || ev == BSP_BTN_RELEASE);
+    ++edge_events;
+}
+
+static void check_edge_mode(void) {
+    assert(button_cleanup() == ESP_OK);
+    for (int i = 1; i <= BSP_BTN_COUNT * 2; ++i) {
+        reset_faults(); fail_callback = i;
+        assert(bsp_button_init_edges(edge_cb, &edge_events) == ESP_ERR_NO_MEM);
+        assert_clean();
+        assert(!edge_events);
+    }
+    reset_faults();
+    assert(bsp_button_init_edges(edge_cb, &edge_events) == ESP_OK);
+    assert(s_edges_only && callback_calls == BSP_BTN_COUNT * 2);
+    assert(registered[BUTTON_PRESS_DOWN] == BSP_BTN_COUNT);
+    assert(registered[BUTTON_PRESS_UP] == BSP_BTN_COUNT);
+    assert(!registered[BUTTON_SINGLE_CLICK] && !registered[BUTTON_DOUBLE_CLICK] && !registered[BUTTON_LONG_PRESS_START]);
+    button_handle_t ok = s_btn[BSP_BTN_OK];
+    ok->callbacks[BUTTON_PRESS_DOWN](ok, ok->contexts[BUTTON_PRESS_DOWN]);
+    ok->callbacks[BUTTON_PRESS_UP](ok, ok->contexts[BUTTON_PRESS_UP]);
+    assert(edge_events == 2);
+    assert(bsp_button_init(NULL, NULL) == ESP_ERR_INVALID_STATE);
+    assert(s_cb == edge_cb && s_user == &edge_events && s_edges_only);
+    assert(bsp_button_init_edges(NULL, NULL) == ESP_OK);
+    assert(!s_cb && !s_user && create_calls == BSP_BTN_COUNT);
+    assert(bsp_button_init_edges(edge_cb, &edge_events) == ESP_OK);
+    assert(callback_calls == BSP_BTN_COUNT * 2);
+
+    fail_delete = 1;
+    assert(button_cleanup() != ESP_OK);
+    assert(bsp_button_init_edges(edge_cb, &edge_events) == ESP_ERR_INVALID_STATE);
+    fail_delete = 0;
+    assert(button_cleanup() == ESP_OK);
+    assert_clean();
+    reset_faults();
+    assert(bsp_button_init(event_cb, &events) == ESP_OK);
+    assert(callback_calls == BSP_BTN_COUNT * 5 && !s_edges_only);
+    assert(bsp_button_init_edges(edge_cb, &edge_events) == ESP_ERR_INVALID_STATE);
+    assert(s_cb == event_cb && s_user == &events && !s_edges_only);
+    cb_click(NULL, (void *)(intptr_t)BSP_BTN_OK);
+    assert(events == 2);
+    assert(button_cleanup() == ESP_OK);
+}
 int main(void) {
     for (int i = 1; i <= BSP_BTN_COUNT; ++i) {
         reset_faults(); fail_create = i;
@@ -205,5 +263,6 @@ int main(void) {
     assert(bsp_button_init(event_cb, &events) == ESP_ERR_INVALID_STATE);
     fail_delete = 0; assert(button_cleanup() == ESP_OK); retry_success();
     check_deep_sleep_prepare();
+    check_edge_mode();
     puts("BSP button fault-injection tests: PASS");
 }
