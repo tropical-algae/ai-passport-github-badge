@@ -7,7 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-static uint16_t framebuffer[240*320], drawbuffer[240*20];
+static uint16_t framebuffer[240*320], drawbuffer[240*40];
+static unsigned flushed_pixels;
 static badge_data_t data;
 static badge_config_t config;
 static badge_status_t status;
@@ -15,9 +16,11 @@ static lv_display_t *display;
 LV_FONT_DECLARE(badge_font_8);
 LV_FONT_DECLARE(badge_font_10);
 LV_FONT_DECLARE(badge_font_14);
+LV_FONT_DECLARE(badge_font_22);
 static unsigned char avatar_bytes[24576];
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *pixels) {
     const uint16_t *p=(const uint16_t *)pixels;
+    flushed_pixels+=(unsigned)(lv_area_get_width(a)*lv_area_get_height(a));
     for(int y=a->y1;y<=a->y2;y++)for(int x=a->x1;x<=a->x2;x++) {
         uint16_t pixel=*p++;
         framebuffer[y*240+x]=bsp_display_pixel_outside_rounded_rect(x,y,240,320,30)?0:pixel;
@@ -218,6 +221,143 @@ static void fill_data(void) {
     for(unsigned i=0;i<6;i++){strcpy(data.events[i].type,types[i]);snprintf(data.events[i].repo,sizeof(data.events[i].repo),"%s/%s",config.username,names[i%5]);strcpy(data.events[i].date,"2026-10-28");}
     data.last_success=status.now-3600;
 }
+
+static void begin_partial_check(void) {
+    lv_refr_now(display);
+    flushed_pixels=0;
+}
+
+static void assert_partial_matches_full(unsigned maximum,bool changed) {
+    lv_refr_now(display);
+    assert(flushed_pixels<=maximum);
+    assert(changed ? flushed_pixels>0 : flushed_pixels==0);
+    static uint16_t partial[240*320];
+    memcpy(partial,framebuffer,sizeof(partial));
+    /* Force the independent full redraw that the optimization replaces. The
+     * complete display must match, including old toast pixels and QR layers. */
+    lv_obj_invalidate(lv_screen_active());lv_refr_now(display);
+    assert(!memcmp(partial,framebuffer,sizeof(partial)));
+}
+
+static void assert_partial_updates(void) {
+    badge_data_t original_data=data;
+    badge_status_t original_status=status;
+    for(unsigned page=0;page<7;++page) {
+        status.now=original_status.now+10;status.connected=true;
+        status.battery_percent=87;data.retry_after=0;data.sync_message[0]=0;
+        badge_ui_update(&data,&config,&status);
+        begin_partial_check();status.now++;badge_ui_tick(&status);
+        assert_partial_matches_full(0,false);
+        begin_partial_check();status.now+=60;badge_ui_tick(&status);
+        assert_partial_matches_full(240*27,true);
+        begin_partial_check();status.battery_percent=86;badge_ui_tick(&status);
+        assert_partial_matches_full(240*27,true);
+        begin_partial_check();status.connected=false;badge_ui_tick(&status);
+        assert_partial_matches_full(240*27+222*12,true);
+        begin_partial_check();status.connected=true;badge_ui_tick(&status);
+        assert_partial_matches_full(240*27+222*12,true);
+        data.retry_after=status.now+252;strcpy(data.sync_message,"ACTIVITY: RATE LIMIT");
+        badge_ui_update(&data,&config,&status);
+        begin_partial_check();status.now++;badge_ui_tick(&status);
+        assert_partial_matches_full(222*12,true);
+        data.retry_after=INT64_MAX;badge_ui_update(&data,&config,&status);
+        begin_partial_check();status.now++;badge_ui_tick(&status);
+        assert_partial_matches_full(0,false); /* Still displays 999D+. */
+        begin_partial_check();badge_ui_notify("FETCH FAILED\nPROFILE / TLS CONNECT FAILED",true);
+        assert_partial_matches_full(224*36,true);
+        begin_partial_check();badge_ui_notify("SYNC COMPLETE",false);
+        assert_partial_matches_full(224*36,true); /* Erases old first line. */
+        begin_partial_check();badge_ui_notify(NULL,false);
+        assert_partial_matches_full(224*36,true);
+        begin_partial_check();badge_ui_notify("SYNC COMPLETE\nCACHED DATA",false);
+        assert_partial_matches_full(224*36,true);
+        begin_partial_check();lv_tick_inc(4001);badge_ui_tick(&status);
+        assert_partial_matches_full(224*36,true);
+        if(page==3) {
+            status.now=(original_status.now/86400+1)*86400-1;
+            data.days[0].day=(int32_t)(status.now/86400+1);
+            data.days[0].coverage=BADGE_KNOWN;data.days[0].pushes=3;
+            data.retry_after=0;badge_ui_update(&data,&config,&status);
+            begin_partial_check();status.now++;badge_ui_tick(&status);
+            assert_partial_matches_full(240*27+222*143,true);
+            data=original_data;
+        }
+        badge_ui_key(BADGE_KEY_DOWN,true);
+    }
+    data=original_data;status=original_status;
+    badge_ui_update(&data,&config,&status);
+    begin_partial_check();badge_ui_key(BADGE_KEY_UP,false);
+    assert_partial_matches_full(0,false); /* PROFILE has no up/down focus. */
+    badge_ui_key(BADGE_KEY_OK,false);lv_refr_now(display);
+    begin_partial_check();status.now+=60;badge_ui_tick(&status);
+    assert_partial_matches_full(240*27,true);
+    begin_partial_check();badge_ui_notify("FETCH FAILED\nNETWORK TIMEOUT",true);
+    assert_partial_matches_full(224*36,true);
+    begin_partial_check();badge_ui_notify(NULL,false);
+    assert_partial_matches_full(224*36,true);
+    badge_ui_key(BADGE_KEY_OK,false);
+    status=original_status;badge_ui_update(&data,&config,&status);lv_refr_now(display);
+    puts("partial clock/battery/status/toast/day/QR updates match full-frame pixels");
+}
+
+/* Retain the old fitting algorithm as a visual oracle, not production code.
+ * It deliberately scans repeatedly so a wrong linear boundary is caught. */
+static void reference_fit(char out[196],const char *value,int width,const lv_font_t *font) {
+    size_t input=strlen(value),length=input<192?input:192;
+    if(length<input)while(length && ((unsigned char)value[length]&0xc0)==0x80)--length;
+    memcpy(out,value,length);out[length]=0;
+    for(size_t i=0;i<length;++i)if(out[i]=='\n' || out[i]=='\r' || out[i]=='\t')out[i]=' ';
+    lv_point_t size;lv_text_get_size(&size,out,font,0,0,LV_COORD_MAX,LV_TEXT_FLAG_EXPAND);
+    bool shortened=length<input;
+    while(length && size.x>width) {
+        --length;while(length && ((unsigned char)out[length]&0xc0)==0x80)--length;
+        out[length]=0;shortened=true;
+        char candidate[196];memcpy(candidate,out,length);memcpy(candidate+length,"...",4);
+        lv_text_get_size(&size,candidate,font,0,0,LV_COORD_MAX,LV_TEXT_FLAG_EXPAND);
+    }
+    if(shortened)memcpy(out+length,"...",4);
+}
+
+static void assert_linear_text_fitting(void) {
+    badge_data_t original=data;
+    const char *examples[]={
+        "", "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+        "Abc.123/WWW/iii/variable-width-text-that-needs-an-ellipsis",
+        "中文开发者开源实验室中国上海中文开发者开源实验室中国上海",
+        "CJK中文/Café/😀/a\tb\nc\rd/超长字符串mixed-width-suffix",
+        "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"
+    };
+    for(unsigned i=0;i<sizeof(examples)/sizeof(examples[0]);++i) {
+        char expected[196];
+        snprintf(data.blog,sizeof(data.blog),"%s",examples[i]);
+        reference_fit(expected,data.blog,151,&badge_font_8);
+        badge_ui_update(&data,&config,&status);lv_refr_now(display);
+        uint32_t actual=area_hash(80,170,151,12);
+        snprintf(data.blog,sizeof(data.blog),"%s",expected);
+        badge_ui_update(&data,&config,&status);lv_refr_now(display);
+        assert(area_hash(80,170,151,12)==actual);
+
+        snprintf(data.name,sizeof(data.name),"%s",examples[i]);
+        reference_fit(expected,data.name,222,&badge_font_10);
+        badge_ui_update(&data,&config,&status);lv_refr_now(display);
+        actual=area_hash(9,87,222,14);
+        snprintf(data.name,sizeof(data.name),"%s",expected);
+        badge_ui_update(&data,&config,&status);lv_refr_now(display);
+        assert(area_hash(9,87,222,14)==actual);
+    }
+    for(unsigned length=1;length<=39;++length) {
+        memset(data.username,'W',length);data.username[length]=0;
+        char expected[196];reference_fit(expected,data.username,222,&badge_font_22);
+        badge_ui_update(&data,&config,&status);lv_refr_now(display);
+        uint32_t actual=area_hash(9,57,222,26);
+        snprintf(data.username,sizeof(data.username),"%s",expected);
+        badge_ui_update(&data,&config,&status);lv_refr_now(display);
+        assert(area_hash(9,57,222,26)==actual);
+    }
+    data=original;badge_ui_update(&data,&config,&status);lv_refr_now(display);
+    puts("linear UTF-8 fitting matches reference pixels for mixed text and username lengths");
+}
+
 int main(int argc,char **argv) {
     lv_init();display=lv_display_create(240,320);lv_display_set_color_format(display,LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(display,drawbuffer,NULL,sizeof(drawbuffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(display,flush);
@@ -287,6 +427,8 @@ int main(int argc,char **argv) {
         puts("native avatar checks passed");
         return 0;
     }
+    assert_partial_updates();
+    assert_linear_text_fitting();
     for(unsigned i=0;i<7;i++) {
         char name[32];snprintf(name,sizeof(name),"page-%u",i);save(name);
         if(i==3)assert_activity_cells_solid();

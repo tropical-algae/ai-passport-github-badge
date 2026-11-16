@@ -6,6 +6,7 @@
 #include "src/draw/lv_image_decoder_private.h"
 #include "src/libs/qrcode/qrcodegen.h"
 #include "src/misc/cache/instance/lv_image_cache.h"
+#include "src/misc/lv_text_private.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -78,9 +79,25 @@ static uint32_t mixed(uint32_t a, uint32_t b, unsigned percent)
     return out;
 }
 
+/* DRAW_MAIN runs once per DMA-sized strip. Cull before preparing labels or
+ * allocating draw tasks; LVGL's renderer clips only after that work is done. */
+static bool visible(const lv_layer_t *layer, int x, int y, int w, int h)
+{
+    return w>0 && h>0 && x<=layer->_clip_area.x2 && y<=layer->_clip_area.y2 &&
+           x+w-1>=layer->_clip_area.x1 && y+h-1>=layer->_clip_area.y1;
+}
+
+static void invalidate(int x, int y, int w, int h)
+{
+    if(screen) {
+        const lv_area_t area={x,y,x+w-1,y+h-1};
+        lv_obj_invalidate_area(screen,&area);
+    }
+}
+
 static void rect(lv_layer_t *layer, int x, int y, int w, int h, uint32_t color)
 {
-    if (w <= 0 || h <= 0) return;
+    if (!visible(layer,x,y,w,h)) return;
     lv_draw_rect_dsc_t d;
     lv_draw_rect_dsc_init(&d);
     d.bg_color = lv_color_hex(color);
@@ -105,18 +122,16 @@ static void focus(lv_layer_t *layer, int x, int y, int w, int h, uint32_t accent
     rect(layer,x,y+h-5,5,5,accent); rect(layer,x+w-5,y+h-5,5,5,accent);
 }
 
-static size_t previous_utf8(const char *s, size_t length)
-{
-    if (!length) return 0;
-    --length;
-    while (length && ((unsigned char)s[length] & 0xc0) == 0x80) --length;
-    return length;
-}
-
 static void text(lv_layer_t *layer, int x, int y, int width, const char *value,
                  const lv_font_t *font, uint32_t color, lv_text_align_t align)
 {
-    if (!value || width <= 0) return;
+    if(!value || width<=0)return;
+    /* CJK fallback glyphs can extend above the base font's label box. A
+     * conservative font-sized margin preserves that ink across DMA strips. */
+    int margin=font->line_height;
+    for(const lv_font_t *fallback=font->fallback;fallback;fallback=fallback->fallback)
+        if(fallback->line_height>margin)margin=fallback->line_height;
+    if(!visible(layer,x-margin,y-margin,width+2*margin,(int)font->line_height+4+2*margin))return;
     char fitted[196];
     size_t input = strlen(value), length = input < sizeof(fitted)-4 ? input : sizeof(fitted)-4;
     if (length < input) while (length && ((unsigned char)value[length] & 0xc0) == 0x80) --length;
@@ -126,14 +141,25 @@ static void text(lv_layer_t *layer, int x, int y, int width, const char *value,
     lv_point_t size;
     lv_text_get_size(&size,fitted,font,0,0,LV_COORD_MAX,LV_TEXT_FLAG_EXPAND);
     bool shortened = length < input;
-    while (length && size.x > width) {
-        length = previous_utf8(fitted,length);
-        fitted[length] = 0;
+    if (length && size.x > width) {
+        /* Evaluate each UTF-8 prefix once, including the kerning change when
+         * its last glyph is followed by '.', rather than repeatedly measuring
+         * almost the same long string. Keep the longest fitting prefix even
+         * for a font whose pair advances are not strictly monotonic. */
+        const int dots=2*lv_font_get_glyph_width(font,'.','.')+
+                         lv_font_get_glyph_width(font,'.',0);
+        int prefix=0;
+        size_t best=0;
+        uint32_t offset=0;
+        while(offset<length) {
+            uint32_t letter,next;
+            lv_text_encoded_letter_next_2(fitted,&letter,&next,&offset);
+            if(offset>=length)break; /* At least one glyph must be removed. */
+            if(prefix+lv_font_get_glyph_width(font,letter,'.')+dots<=width)best=offset;
+            prefix+=lv_font_get_glyph_width(font,letter,next);
+        }
+        length=best;
         shortened = true;
-        char trial[196];
-        memcpy(trial,fitted,length);
-        memcpy(trial+length,"...",4);
-        lv_text_get_size(&size,trial,font,0,0,LV_COORD_MAX,LV_TEXT_FLAG_EXPAND);
     }
     if (shortened && length + 3 < sizeof(fitted)) memcpy(fitted+length,"...",4);
     lv_draw_label_dsc_t d;
@@ -154,6 +180,7 @@ static void text(lv_layer_t *layer, int x, int y, int width, const char *value,
 static void center_ascii(lv_layer_t *l, int x, int y, int width, int height,
                          const char *value, const lv_font_t *font, uint32_t color)
 {
+    if(!visible(l,x,y-(int)font->line_height,width,height+2*(int)font->line_height))return;
     int ink_top=0, ink_bottom=0;
     bool visible=false;
     for(const unsigned char *p=(const unsigned char *)value; *p; ++p) {
@@ -173,6 +200,7 @@ static void center_ascii(lv_layer_t *l, int x, int y, int width, int height,
 
 static void section(lv_layer_t *l, int y, const char *name)
 {
+    if(!visible(l,9,y,222,(int)badge_font_8.line_height+4))return;
     const badge_theme_t *t = theme();
     rect(l,9,y+3,3,3,t->accent);
     lv_point_t size;
@@ -190,6 +218,7 @@ static void number(uint32_t value, bool valid, char out[20])
 static void stats(lv_layer_t *l, int y, const uint32_t values[3],
                   const bool valid[3], const char *const labels[3])
 {
+    if(!visible(l,9,y,222,44))return;
     const badge_theme_t *t = theme();
     rect(l,9,y,222,1,t->line); rect(l,9,y+43,222,1,t->line);
     for (unsigned i=0; i<3; ++i) {
@@ -242,6 +271,7 @@ static void tabs(lv_layer_t *l, const char *first, const char *second, uint8_t a
 
 static void draw_avatar(lv_layer_t *l)
 {
+    if(!visible(l,9,122,62,62))return;
     const badge_theme_t *t=theme();
     rect(l,13,126,54,54,t->avatar);
     if (avatar_valid) {
@@ -311,11 +341,12 @@ static void repositories(lv_layer_t *l)
 static void donut(lv_layer_t *l, const badge_scope_t *scope)
 {
     const badge_theme_t *t=theme();
+    bool ring_visible=visible(l,8,185,85,85);
     lv_draw_arc_dsc_t arc;
     lv_draw_arc_dsc_init(&arc);
     arc.center=(lv_point_t){50,227}; arc.radius=41; arc.width=16;
     arc.start_angle=0; arc.end_angle=360; arc.color=lv_color_hex(t->track);
-    lv_draw_arc(l,&arc);
+    if(ring_visible)lv_draw_arc(l,&arc);
     uint64_t cumulative=0;
     int previous=270;
     for (unsigned i=0;i<scope->count && i<BADGE_LANGS;++i) {
@@ -324,7 +355,7 @@ static void donut(lv_layer_t *l, const badge_scope_t *scope)
         if (end>previous) {
             arc.start_angle=previous; arc.end_angle=end;
             arc.color=lv_color_hex(t->palette[i==5?7:i]);
-            lv_draw_arc(l,&arc);
+            if(ring_visible)lv_draw_arc(l,&arc);
         }
         previous=end;
         frame(l,103,188+(int)i*14,9,9,2,t->palette[i==5?7:i]);
@@ -373,11 +404,11 @@ static void activity(lv_layer_t *l)
     const char *labels[]={"EVENTS","PUSH EVT","PUSH DAYS"};
     stats(l,61,values,good,labels);
     section(l,116,"24 WEEKS / SUN-SAT / OBSERVED");
-    uint32_t weeks[12]={0};
     int32_t today=(int32_t)(status.now/86400);
     for (unsigned i=0;i<BADGE_DAYS;++i) {
         const badge_day_t *day=&data->days[i];
         int x=9+(int)(i/7)*9, y=132+(int)(i%7)*10;
+        if(!visible(l,x,y,7,8))continue;
         uint32_t color=day->pushes==0?t->heat0:day->pushes==1?t->heat1:day->pushes==2?t->heat2:t->accent;
         if (!day->day || day->day>today) rect(l,x,y,7,8,mixed(t->heat0,t->background,25));
         else if (day->coverage==BADGE_UNKNOWN) {
@@ -388,11 +419,14 @@ static void activity(lv_layer_t *l)
             if (day->coverage==BADGE_PARTIAL) color=mixed(color,t->background,60);
             rect(l,x,y,7,8,color);
         }
-        if (i>=84 && day->day<=today) weeks[(i-84)/7]+=day->pushes;
     }
     TXT(l,9,205,125,". UNKNOWN  DIM PARTIAL",&badge_font_8,t->muted);
     RIGHT(l,160,205,71,"NOW",&badge_font_8,t->muted);
     section(l,221,"RECENT 12 WEEKS / PUSH EVT");
+    if(!visible(l,9,235,222,40))return;
+    uint32_t weeks[12]={0};
+    for(unsigned i=84;i<BADGE_DAYS;++i)
+        if(data->days[i].day<=today)weeks[(i-84)/7]+=data->days[i].pushes;
     uint32_t maximum=1;
     for (unsigned i=0;i<12;++i) if (weeks[i]>maximum) maximum=weeks[i];
     rect(l,9,274,222,1,t->line);
@@ -552,31 +586,39 @@ static void clock_string(int64_t epoch,char *out,size_t size)
 static void chrome(lv_layer_t *l)
 {
     const badge_theme_t *t=theme();
-    char heading[64],battery[8],clock[24];
-    if(state.settings!=BADGE_SETTINGS_CLOSED)snprintf(heading,sizeof(heading),"GITHUB / SETTINGS");
-    else snprintf(heading,sizeof(heading),"GITHUB / %s - %02u",page_names[state.page],state.page+1);
-    rect(l,8,11,5,5,status.connected?t->accent:t->muted);
-    TXT(l,18,9,161,heading,&badge_font_8,t->muted);
-    int level=status.battery_percent;
-    if(level>=0) {if(level>100)level=100;snprintf(battery,sizeof(battery),"%d%%",level);}
-    else snprintf(battery,sizeof(battery),"--%%");
-    lv_point_t battery_size;
-    lv_text_get_size(&battery_size,battery,&badge_font_8,0,0,LV_COORD_MAX,LV_TEXT_FLAG_EXPAND);
-    int battery_text_x=233-battery_size.x;
-    int battery_icon_x=battery_text_x-3-19;
-    frame(l,battery_icon_x,10,17,9,1,t->muted);rect(l,battery_icon_x+17,13,2,3,t->muted);
-    if(level>=0)rect(l,battery_icon_x+2,12,13*level/100,5,t->accent);
-    TXT(l,battery_text_x,9,battery_size.x,battery,&badge_font_8,0xffffff);
-    rect(l,0,26,240,1,t->line); rect(l,0,293,240,1,t->line);
-    rect(l,13,304,1,1,t->muted);rect(l,12,305,3,1,t->muted);rect(l,11,306,5,1,t->muted);
-    TXT(l,20,303,43,"PREV",&badge_font_8,t->muted);
-    RIGHT(l,177,303,43,"NEXT",&badge_font_8,t->muted);
-    rect(l,224,304,5,1,t->muted);rect(l,225,305,3,1,t->muted);rect(l,226,306,1,1,t->muted);
-    clock_string(status.now,clock,sizeof(clock));
-    CENTER(l,66,303,108,clock,&badge_font_8,t->accent);
-    const char *title=state.settings==BADGE_SETTINGS_CLOSED?page_titles[state.page]:state.settings==BADGE_SETTINGS_MAIN?"SETTINGS":state.settings==BADGE_SETTINGS_THEME?"COLOR THEME":state.settings==BADGE_SETTINGS_SCREEN_TIMEOUT?"AUTO SCREEN OFF":"BRIGHTNESS";
-    char title_line[40];snprintf(title_line,sizeof(title_line),"> %s",title);
-    TXT(l,9,35,222,title_line,&badge_font_14,t->accent);
+    if(visible(l,0,0,240,27)) {
+        char heading[64],battery[8];
+        if(state.settings!=BADGE_SETTINGS_CLOSED)snprintf(heading,sizeof(heading),"GITHUB / SETTINGS");
+        else snprintf(heading,sizeof(heading),"GITHUB / %s - %02u",page_names[state.page],state.page+1);
+        rect(l,8,11,5,5,status.connected?t->accent:t->muted);
+        TXT(l,18,9,161,heading,&badge_font_8,t->muted);
+        int level=status.battery_percent;
+        if(level>=0) {if(level>100)level=100;snprintf(battery,sizeof(battery),"%d%%",level);}
+        else snprintf(battery,sizeof(battery),"--%%");
+        lv_point_t battery_size;
+        lv_text_get_size(&battery_size,battery,&badge_font_8,0,0,LV_COORD_MAX,LV_TEXT_FLAG_EXPAND);
+        int battery_text_x=233-battery_size.x;
+        int battery_icon_x=battery_text_x-3-19;
+        frame(l,battery_icon_x,10,17,9,1,t->muted);rect(l,battery_icon_x+17,13,2,3,t->muted);
+        if(level>=0)rect(l,battery_icon_x+2,12,13*level/100,5,t->accent);
+        TXT(l,battery_text_x,9,battery_size.x,battery,&badge_font_8,0xffffff);
+        rect(l,0,26,240,1,t->line);
+    }
+    if(visible(l,0,293,240,27)) {
+        char clock[24];
+        rect(l,0,293,240,1,t->line);
+        rect(l,13,304,1,1,t->muted);rect(l,12,305,3,1,t->muted);rect(l,11,306,5,1,t->muted);
+        TXT(l,20,303,43,"PREV",&badge_font_8,t->muted);
+        RIGHT(l,177,303,43,"NEXT",&badge_font_8,t->muted);
+        rect(l,224,304,5,1,t->muted);rect(l,225,305,3,1,t->muted);rect(l,226,306,1,1,t->muted);
+        clock_string(status.now,clock,sizeof(clock));
+        CENTER(l,66,303,108,clock,&badge_font_8,t->accent);
+    }
+    if(visible(l,9,35,222,(int)badge_font_14.line_height+4)) {
+        const char *title=state.settings==BADGE_SETTINGS_CLOSED?page_titles[state.page]:state.settings==BADGE_SETTINGS_MAIN?"SETTINGS":state.settings==BADGE_SETTINGS_THEME?"COLOR THEME":state.settings==BADGE_SETTINGS_SCREEN_TIMEOUT?"AUTO SCREEN OFF":"BRIGHTNESS";
+        char title_line[40];snprintf(title_line,sizeof(title_line),"> %s",title);
+        TXT(l,9,35,222,title_line,&badge_font_14,t->accent);
+    }
 }
 
 static bool waiting_to_retry(int64_t now)
@@ -584,34 +626,38 @@ static bool waiting_to_retry(int64_t now)
     return now>=1577836800 && data->retry_after>now;
 }
 
-static void status_line(lv_layer_t *l)
+static void status_message(const badge_status_t *view,char *message,size_t size)
 {
-    const badge_theme_t *t=theme();
-    char message[96];
     uint32_t section_bits[]={BADGE_PROFILE,BADGE_REPOSITORIES,BADGE_LANGUAGES,BADGE_ACTIVITY,
         state.pr_tab?BADGE_ISSUES:BADGE_PULLS,state.star_tab?BADGE_GISTS:BADGE_STARS,BADGE_ACTIVITY};
     uint32_t bit=section_bits[state.page];
     bool partial=(data->valid&bit) && !(data->complete&bit);
-    if(status.syncing)snprintf(message,sizeof(message),"%s",data->sync_message[0]?data->sync_message:"SYNCING PUBLIC DATA...");
-    else if(!status.connected)snprintf(message,sizeof(message),"OFFLINE / %s",data->valid?"CACHED DATA":"NO CACHED DATA");
-    else if(status.now<1577836800)snprintf(message,sizeof(message),"WAITING FOR CLOCK / FIRST SYNC");
-    else if(waiting_to_retry(status.now)) {
-        char remaining[20];badge_format_wait(data->retry_after,status.now,remaining,sizeof(remaining));
+    if(view->syncing)snprintf(message,size,"%s",data->sync_message[0]?data->sync_message:"SYNCING PUBLIC DATA...");
+    else if(!view->connected)snprintf(message,size,"OFFLINE / %s",data->valid?"CACHED DATA":"NO CACHED DATA");
+    else if(view->now<1577836800)snprintf(message,size,"WAITING FOR CLOCK / FIRST SYNC");
+    else if(waiting_to_retry(view->now)) {
+        char remaining[20];badge_format_wait(data->retry_after,view->now,remaining,sizeof(remaining));
         const char *reason=data->sync_message;
         while(!strncmp(reason,"PARTIAL / ",10))reason+=10;
-        snprintf(message,sizeof(message),"%s %s / %.63s",strstr(reason,"RATE LIMIT")?"LIMIT":"RETRY",
+        snprintf(message,size,"%s %s / %.63s",strstr(reason,"RATE LIMIT")?"LIMIT":"RETRY",
                  remaining,reason[0]?reason:"AUTOMATIC RETRY");
     }
     else if(strstr(data->sync_message,"PARTIAL") || strstr(data->sync_message,"NOT SAVED") ||
-            strstr(data->sync_message,"STORAGE ERROR"))snprintf(message,sizeof(message),"%s",data->sync_message);
+            strstr(data->sync_message,"STORAGE ERROR"))snprintf(message,size,"%s",data->sync_message);
     else if(state.page==2 && state.settings==BADGE_SETTINGS_CLOSED) {
         const badge_scope_t *scope=&data->scopes[state.language];
-        snprintf(message,sizeof(message),"%s%u/%u REPOS / %s",status.connected?"":"OFFLINE / ",
+        snprintf(message,size,"%s%u/%u REPOS / %s",view->connected?"":"OFFLINE / ",
                  (unsigned)scope->fetched_repos,(unsigned)scope->total_repos,scope->complete?"READY":"PARTIAL");
-    } else if(partial)snprintf(message,sizeof(message),"PARTIAL PUBLIC DATA / CACHED");
-    else if(data->last_success) {char date[24];clock_string(data->last_success,date,sizeof(date));snprintf(message,sizeof(message),"SYNC %s",date);}
-    else snprintf(message,sizeof(message),"%s",status.message[0]?status.message:"WAITING FOR FIRST SYNC");
-    TXT(l,9,281,222,message,&badge_font_8,t->muted);
+    } else if(partial)snprintf(message,size,"PARTIAL PUBLIC DATA / CACHED");
+    else if(data->last_success) {char date[24];clock_string(data->last_success,date,sizeof(date));snprintf(message,size,"SYNC %s",date);}
+    else snprintf(message,size,"%s",view->message[0]?view->message:"WAITING FOR FIRST SYNC");
+}
+
+static void status_line(lv_layer_t *l)
+{
+    if(!visible(l,9,281,222,(int)badge_font_8.line_height+4))return;
+    char message[96];status_message(&status,message,sizeof(message));
+    TXT(l,9,281,222,message,&badge_font_8,theme()->muted);
 }
 
 static void modal(lv_layer_t *l)
@@ -651,11 +697,13 @@ static void draw(lv_event_t *event)
     chrome(l);
     if(state.modal!=BADGE_MODAL_NONE)modal(l);
     else {
-        if(state.settings!=BADGE_SETTINGS_CLOSED)settings(l);
-        else switch(state.page) {
-        case 0:profile(l);break; case 1:repositories(l);break;case 2:languages(l);break;
-        case 3:activity(l);break;case 4:pulls_issues(l);break;case 5:stars_gists(l);break;
-        default:timeline(l);break;
+        if(visible(l,0,55,240,224)) {
+            if(state.settings!=BADGE_SETTINGS_CLOSED)settings(l);
+            else switch(state.page) {
+            case 0:profile(l);break; case 1:repositories(l);break;case 2:languages(l);break;
+            case 3:activity(l);break;case 4:pulls_issues(l);break;case 5:stars_gists(l);break;
+            default:timeline(l);break;
+            }
         }
         status_line(l);
     }
@@ -759,26 +807,39 @@ void badge_ui_update(const badge_data_t *new_data, const badge_config_t *new_con
 
 void badge_ui_tick(const badge_status_t *new_status)
 {
-    bool changed=status.now/60!=new_status->now/60 || status.battery_percent!=new_status->battery_percent ||
-                 status.connected!=new_status->connected || status.syncing!=new_status->syncing ||
-                 status.provisioning!=new_status->provisioning || strcmp(status.message,new_status->message);
+    if(status.now/60!=new_status->now/60)invalidate(0,293,240,27);
+    if(status.battery_percent!=new_status->battery_percent || status.connected!=new_status->connected)
+        invalidate(0,0,240,27);
+    /* The activity view also uses today's UTC day to hide future cells. */
+    if(state.modal==BADGE_MODAL_NONE && state.settings==BADGE_SETTINGS_CLOSED && state.page==3 &&
+       status.now/86400!=new_status->now/86400)invalidate(9,132,222,143);
+    if(state.modal==BADGE_MODAL_NONE && (status.now!=new_status->now ||
+       status.connected!=new_status->connected || status.syncing!=new_status->syncing ||
+       strcmp(status.message,new_status->message))) {
+        char before[96],after[96];
+        status_message(&status,before,sizeof(before));
+        status_message(new_status,after,sizeof(after));
+        /* A long retry can show the same minute/hour for many ticks. */
+        if(strcmp(before,after))invalidate(9,281,222,12);
+    }
     bool ap_changed=status.provisioning!=new_status->provisioning ||
                     status.provisioning_busy!=new_status->provisioning_busy ||
                     status.provisioning_session!=new_status->provisioning_session ||
                     status.provisioning_ready_session!=new_status->provisioning_ready_session ||
                     strcmp(status.ap_ssid,new_status->ap_ssid) || strcmp(status.ap_password,new_status->ap_password);
-    /* Keep the visible countdown moving, including its transition to ready,
-     * without redrawing idle pages on every application tick. */
-    if(status.now!=new_status->now && new_status->connected && !new_status->syncing &&
-       state.modal==BADGE_MODAL_NONE && (waiting_to_retry(status.now)||waiting_to_retry(new_status->now)))changed=true;
+    bool modal_changed=state.modal==BADGE_MODAL_WIFI &&
+                       (ap_changed || status.syncing!=new_status->syncing);
     status=*new_status;
-    if(ap_changed) {update_qr();changed=true;}
-    if(toast_text[0]&&(int32_t)(toast_until-lv_tick_get())<=0) {toast_text[0]=0;changed=true;}
-    if(changed)lv_obj_invalidate(screen);
+    if(ap_changed)update_qr();
+    if(modal_changed)invalidate(0,27,240,266);
+    if(toast_text[0]&&(int32_t)(toast_until-lv_tick_get())<=0) {
+        toast_text[0]=0;invalidate(8,255,224,36);
+    }
 }
 
 badge_action_t badge_ui_key(badge_key_t key, bool long_press)
 {
+    badge_ui_state_t previous=state;
     badge_action_t action=badge_ui_state_key(&state,key,long_press,data,&config);
     if(action.kind==BADGE_ACTION_PROVISION) {
         badge_ui_show_provision();return action;
@@ -786,7 +847,8 @@ badge_action_t badge_ui_key(badge_key_t key, bool long_press)
     if(!long_press && key==BADGE_KEY_OK && state.settings==BADGE_SETTINGS_CLOSED && state.page==2 && state.modal==BADGE_MODAL_NONE) {
         badge_ui_notify("USE UP / DOWN TO CHANGE",false);
     }
-    update_qr();lv_obj_invalidate(screen);return action;
+    if(memcmp(&previous,&state,sizeof(state))) {update_qr();lv_obj_invalidate(screen);}
+    return action;
 }
 
 void badge_ui_show_provision(void)
@@ -824,7 +886,9 @@ void badge_ui_notify(const char *message,bool error)
         if(newline[1])toast_detail=newline+1;
     }
     toast_error=error;toast_until=lv_tick_get()+4000;
-    if(screen)lv_obj_invalidate(screen);
+    /* Cover both one- and two-line layouts, so a replacement or dismissal
+     * also restores the pixels occupied by the previous notification. */
+    invalidate(8,255,224,36);
 }
 
 enum { AVATAR_SIDE=54, AVATAR_PIXELS=54*54, AVATAR_RGB_BYTES=54*54*2 };
