@@ -250,8 +250,89 @@ async function setupAcknowledgement(initiallySaved = false) {
     assert.match(elements.status.textContent, /hotspot closed.*badge is ready/i);
 }
 
+async function scanPolling() {
+    const ids = ['setup', 'status', 'error', 'save', 'scan', 'scan_status', 'networks', 'ssid', 'password', 'open_network', 'username', 'interval', 'nonce', 'utc_offset', 'export', 'backup_download', 'restore', 'restore_file', 'backup_status'];
+    const elements = Object.fromEntries(ids.map(id => [id, new Element()]));
+    const nonce = '0123456789abcdef0123459abcdef01234';
+    const calls = [];
+    let scanning = false, scanFails = false, listFails = false, releaseList;
+    const context = vm.createContext({
+        document: {querySelector: selector => elements[selector.slice(1)], getElementById: id => elements[id], createElement: () => new Element()},
+        window: {addEventListener() {}}, Date, URLSearchParams, URL: {}, setTimeout() {},
+        fetch: async (url, options = {}) => {
+            calls.push({url, options});
+            if (url === '/api/state') return {ok: true, json: async () => ({ssid: 'Saved', username: 'octocat', interval: 6, nonce, open: false, pending: false, saved: false, message: 'Ready'})};
+            if (url === '/api/scan') {
+                assert.equal(options.headers['X-Setup-Nonce'], nonce);
+                return {ok: !scanFails, json: async () => ({message: scanFails ? 'Radio busy' : 'Scanning'})};
+            }
+            if (url === '/api/networks') {
+                if (releaseList) await new Promise(resolve => { releaseList = resolve; });
+                return {ok: !listFails, json: async () => ({scanning, message: scanning ? 'Scanning' : 'Scan complete', networks: [{ssid: 'Home', rssi: -50, open: false}]})};
+            }
+            throw new Error(`Unexpected ${url}`);
+        }
+    });
+    const html = fs.readFileSync(path.join(__dirname, '../main/badge_portal.html'), 'utf8');
+    const settle = async () => { for (let i = 0; i < 8; ++i) await new Promise(resolve => setImmediate(resolve)); };
+    const listCount = () => calls.filter(call => call.url === '/api/networks').length;
+    vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], context);
+    await settle();
+    assert.equal(listCount(), 1, 'Load the first completed scan once');
+    for (let i = 0; i < 5; ++i) await vm.runInContext('refresh()', context);
+    assert.equal(listCount(), 1, 'Status polls must not repeatedly serialize an unchanged scan list');
+    assert.equal(elements.networks.children.length, 1);
+
+    scanning = true;
+    await elements.scan.fire('click');
+    assert.equal(listCount(), 2, 'Manual scan starts new result polling');
+    assert.equal(elements.scan.disabled, true);
+    await vm.runInContext('refresh()', context);
+    assert.equal(listCount(), 3);
+    scanning = false;
+    await vm.runInContext('refresh()', context);
+    assert.equal(listCount(), 4, 'Fetch the terminal result even when scanning has just completed');
+    assert.equal(elements.scan.disabled, false);
+    await vm.runInContext('refresh()', context);
+    assert.equal(listCount(), 4);
+
+    scanFails = true;
+    await elements.scan.fire('click');
+    assert.match(elements.scan_status.textContent, /Radio busy/);
+    assert.equal(elements.scan.disabled, false);
+    await vm.runInContext('refresh()', context);
+    assert.equal(listCount(), 4, 'Rejected scan does not start list polling');
+
+    scanFails = false;
+    listFails = true;
+    await elements.scan.fire('click');
+    assert.equal(listCount(), 5);
+    assert.match(elements.scan_status.textContent, /Retrying/);
+    listFails = false;
+    await vm.runInContext('refresh()', context);
+    assert.equal(listCount(), 6, 'A failed result request must be retried, even if scan has finished');
+    assert.equal(elements.scan.disabled, false);
+    await vm.runInContext('refresh()', context);
+    assert.equal(listCount(), 6);
+
+    releaseList = true;
+    const manualScan = elements.scan.fire('click');
+    await settle();
+    assert.equal(typeof releaseList, 'function');
+    await vm.runInContext('refresh()', context);
+    assert.equal(listCount(), 7, 'Status refresh must not overlap an in-flight result request');
+    const finishList = releaseList;
+    releaseList = undefined;
+    finishList();
+    await manualScan;
+    await vm.runInContext('refresh()', context);
+    assert.equal(listCount(), 7);
+    console.log('Badge portal bounded scan-result polling tests: PASS');
+}
+
 (async () => {
     await main();
+    await scanPolling();
     await setupAcknowledgement();
     await setupAcknowledgement(true);
     console.log('Badge portal saved-result acknowledgement tests: PASS');

@@ -40,7 +40,7 @@ const ssid=document.querySelector('#ssid'),password=document.querySelector('#pas
 const backupDownload=document.querySelector('#backup_download');
 const exportButton=document.querySelector('#export'),restoreButton=document.querySelector('#restore'),restoreFile=document.querySelector('#restore_file'),backupStatus=document.querySelector('#backup_status');
 let backupUrl='';
-let loaded=false,busy=false,finished=false,acknowledged=0,failures=0,pending=false,scanning=false,networkKey='',restarting=false;
+let loaded=false,busy=false,finished=false,acknowledged=0,failures=0,pending=false,scanning=false,networksPending=false,networksLoading=false,networkKey='',restarting=false;
 document.querySelector('#utc_offset').value=-new Date().getTimezoneOffset();
 function buttons(){const disabled=!loaded||busy||pending||restarting||finished;save.disabled=disabled;scanButton.disabled=disabled||scanning;exportButton.disabled=disabled;restoreButton.disabled=disabled||!restoreFile.files.length;restoreFile.disabled=busy||pending||restarting||finished;backupDownload.hidden=!backupUrl||disabled;}
 function setOpen(value){openNetwork.checked=value;password.disabled=value;}
@@ -56,12 +56,14 @@ function renderNetworks(items){
  }
 }
 async function refreshNetworks(){
- try{const response=await fetch('/api/networks',{cache:'no-store'});if(!response.ok)return;const data=await response.json();scanning=data.scanning;scanStatus.textContent=data.message;renderNetworks(data.networks);buttons();}catch(e){}
+ if(!networksPending||networksLoading)return;networksLoading=true;
+ try{const response=await fetch('/api/networks',{cache:'no-store'});if(!response.ok)throw new Error('Scan results unavailable');const data=await response.json();scanning=data.scanning;networksPending=scanning;scanStatus.textContent=data.message;renderNetworks(data.networks);buttons();}
+ catch(e){scanStatus.textContent='Unable to load scan results. Retrying…';}finally{networksLoading=false;}
 }
 async function scan(){
  if(!loaded||busy||pending||scanning||finished)return;scanning=true;buttons();scanStatus.textContent='Scanning nearby 2.4 GHz networks…';
  try{const response=await fetch('/api/scan',{method:'POST',headers:{'X-Setup-Nonce':document.querySelector('#nonce').value}});const data=await response.json();
-  if(!response.ok)throw new Error(data.message||'Unable to scan');scanStatus.textContent=data.message;
+  if(!response.ok)throw new Error(data.message||'Unable to scan');scanStatus.textContent=data.message;networksPending=true;await refreshNetworks();
  }catch(e){scanning=false;scanStatus.textContent=e.message;}finally{buttons();}
 }
 scanButton.addEventListener('click',scan);
@@ -75,7 +77,7 @@ async function refresh(){
   // The device closes only after this browser has received the saved result.
   // A missing acknowledgement still permits the device's short fallback.
   if(finished&&Number.isInteger(data.saved_result_id)&&data.saved_result_id>0&&data.saved_result_id<=4294967295&&acknowledged!==data.saved_result_id){try{const ack=await fetch('/api/ack',{method:'POST',headers:{'X-Setup-Nonce':document.querySelector('#nonce').value,'X-Setup-Result':String(data.saved_result_id)}});if(ack.ok)acknowledged=data.saved_result_id;}catch(e){}}
-  if(!finished)await refreshNetworks();
+  if(!finished&&networksPending)await refreshNetworks();
  }catch(e){if(++failures>2){status.textContent=finished?'Setup hotspot closed. Your badge is ready.':'Cannot reach the badge. Stay on its setup Wi-Fi and reload this page.';}}
  if(!restarting&&(!finished||failures<3))setTimeout(refresh,3000);
 }
