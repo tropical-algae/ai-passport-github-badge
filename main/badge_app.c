@@ -65,12 +65,18 @@ static void service_screen(int64_t now) {
         return;
     }
     s_screen_asleep = false; // A failed wake may already have issued SLPOUT.
+    // Log transitions, never idle polls. This distinguishes repeated software
+    // power requests from a panel/backlight artifact after one successful wake.
+    ESP_LOGI(TAG, "Screen %s begin: theme=%u brightness=%u timeout=%u",
+             sleep ? "sleep" : "wake", (unsigned)s_config.theme,
+             (unsigned)s_config.brightness, (unsigned)s_config.screen_timeout_min);
     esp_err_t e = sleep ? bsp_lvgl_sleep() : bsp_lvgl_wake(s_config.brightness);
     bsp_lvgl_unlock();
     if (e == ESP_OK) {
         s_screen_asleep = sleep;
         s_screen_blocked = sleep;
         s_screen_retry_at = 0;
+        ESP_LOGI(TAG, "Screen %s complete", sleep ? "sleep" : "wake");
     } else {
         ESP_LOGW(TAG, "Screen %s failed: %s; retrying", sleep ? "sleep" : "wake", esp_err_to_name(e));
     }

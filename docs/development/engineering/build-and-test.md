@@ -182,6 +182,16 @@ change a version. If firmware builds are explicitly excluded, run the static
 and native GCC checks and report the firmware gate as NOT RUN; neither check
 establishes hardware behavior or replaces the complete release build.
 
+The native UI check also exercises production BSP sleep/wake with real LVGL and
+a simulated panel: all five startup themes, default → yellow → default, all
+pages and brightness levels. It checks every submitted pixel strip, full-frame
+completion before backlight restoration, and subsequent refreshes. This can
+detect software black frames, but does not reproduce physical LCD scanout, PWM,
+FreeRTOS scheduling or the contents of a user's backup. For an intermittent
+wake flash, capture `Screen ... begin/complete` and failure logs while reproducing
+it on-device; report the theme, brightness and whether the backlight itself
+switches off. A passing native check alone does not close a device-only report.
+
 Hardware-affecting changes must also run the applicable on-device checklist in the hardware guide. Report compilation separately from physical-device validation.
 
 The badge release ships both app-only updates at `0x10000` and a verified full image at `0x0`; the app-only file requires the existing compatible badge partition layout. See the [manual release guide](../ci/CI-build-and-release.md).

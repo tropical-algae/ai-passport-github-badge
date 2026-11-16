@@ -8,6 +8,9 @@ output=$(cd "$output" && pwd)
 python3 "$repo_root/tests/ui_render/fixtures.py" "$output/fixtures"
 cmake -S "$repo_root/tests/ui_render" -B "$output/build" -G Ninja -DBADGE_UI_CLIB_ALLOCATOR="${BADGE_UI_CLIB_ALLOCATOR:-OFF}"
 cmake --build "$output/build" --parallel 4
+for theme in 0 1 2 3 4; do
+    "$output/build/badge_ui_wake" "$theme"
+done
 for fixture in avatar.png avatar64.png avatar64.jpg avatar-progressive.jpg avatar-corrupt.png; do
     run_dir="$output/${fixture%.*}"
     if [[ $fixture == avatar64.jpg ]]; then run_dir="$output/avatar64-jpeg"; fi
